@@ -1,0 +1,101 @@
+{
+  "document_type": "TAX INVOICE",
+  "reference_numbers": {
+    "invoice_number": "00287864",
+    "po_number": "PO-TB10084367",
+    "reg_no": "199003066N",
+    "gst_no": "M2-0093369-X",
+    "qaic_ref": "QAIC/SG/380-A"
+  },
+  "dates": {
+    "invoice_date": "06/06/2026"
+  },
+  "vendor": {
+    "name": "EVERRISE PLASTICS INDUSTRIES (PTE) LTD",
+    "address": "71 SUNGEI KADUT DRIVE, SINGAPORE 729577",
+    "phone": "6565 1212",
+    "fax": "6555 1212"
+  },
+  "customer": {
+    "name": "CITY BEST - ELECTRIC PTE LTD",
+    "address": "8 ANG MO KIO INDL. PK 2, WAREHOUSE ~ SG KADUT #07, 7TH STOREY, SINGAPORE 569500"
+  },
+  "assigned_codes": {
+    "account_code": "DG000008",
+    "salesman": "SD007",
+    "terms": "Net EOM"
+  },
+  "handwritten_annotations": [
+    "L.RRAPLASTICSINDUSTRIES+EVTLTD",
+    "恒昇塑膠工业私艺）有限公司",
+    "Quality Assurance",
+    "wwwerl m",
+    "VOTNUMBER: TAX INVOICE",
+    "DATE",
+    "ILL TO",
+    "A/C CODE P.O. NUMBEr TERMS SALESMAN",
+    "T NO. PARTICULARS QUANTITY UNIT PRICE AMOUNT",
+    "cheques should be crossed. made payable to \"EVERRISE ,4I * INDUSTRIES (PTE) LTD\" SUB TOTAL",
+    "26076386:1",
+    "FINANCE DEPARTMENT",
+    "ADD GST G%",
+    "TOTAL",
+    "「EVERRISEPLASTICSINDUSTRIES(PTE)LTD",
+    "SIGNATURE&COMPANYSTAMP ISSUED BY",
+    "11 Marsiling Industrial Estale Roa(d One, #01-31, Singapore 739277 Tel: (65) 6269 9442 Fax: (65) 6367 8771"
+  ],
+  "line_items": [
+    {
+      "t_no": null,
+      "particulars": "E FLASTICS",
+      "quantity": null,
+      "unit": null,
+      "price": null,
+      "amount": 1812.85
+    },
+    {
+      "t_no": null,
+      "particulars": null,
+      "quantity": null,
+      "unit": null,
+      "price": 163.16,
+      "amount": 18
+    }
+  ],
+  "handwritten_notes": [
+    "[unreadable]",
+    "[unreadable]",
+    "L.RRAPLASTICSINDUSTRIES+EVTLTD",
+    "恒昇塑膠工业私艺）有限公司",
+    "Quality Assurance",
+    "wwwerl m",
+    "VOTNUMBER: TAX INVOICE",
+    "[non-text region]",
+    "DATE",
+    "ILL TO",
+    "A/C CODE P.O. NUMBEr TERMS SALESMAN",
+    "T NO. PARTICULARS QUANTITY UNIT PRICE AMOUNT",
+    "[unreadable]",
+    "[unreadable]",
+    "cheques should be crossed. made payable to \"EVERRISE ,4I *  INDUSTRIES (PTE) LTD\" SUB TOTAL",
+    "26076386:1",
+    "FINANCE DEPARTMENT",
+    "ADD GST G%",
+    "TOTAL",
+    "「EVERRISEPLASTICSINDUSTRIES(PTE)LTD",
+    "SIGNATURE&COMPANYSTAMP ISSUED BY",
+    "11 Marsiling Industrial Estale Roa(d One, #01-31, Singapore 739277 Tel: (65) 6269 9442 Fax: (65) 6367 8771"
+  ],
+  "job_id": "d8a0a9a5-9c4d-4e01-8da5-3d2863d6f390",
+  "source": "2897_001_p4.pdf",
+  "submitted_by": "admin@nanowaka.io",
+  "mean_confidence": "76.3",
+  "extracted_at": "2026-10-13T08:05:42.857Z",
+  "the_9": "s$163.16",
+  "doc_id": "00287864",
+  "po_ref": "PO-TB10084367",
+  "MD_Version": "# TAX INVOICE\n\n**document type:** TAX INVOICE\n\n## reference numbers\n\n**invoice number:** 00287864\n\n**po number:** PO-TB10084367\n\n**reg no:** 199003066N\n\n**gst no:** M2-0093369-X\n\n**qaic ref:** QAIC/SG/380-A\n\n## dates\n\n**invoice date:** 06/06/2026\n\n## vendor\n\n**name:** EVERRISE PLASTICS INDUSTRIES (PTE) LTD\n\n**address:** 71 SUNGEI KADUT DRIVE, SINGAPORE 729577\n\n**phone:** 6565 1212\n\n**fax:** 6555 1212\n\n## customer\n\n**name:** CITY BEST - ELECTRIC PTE LTD\n\n**address:** 8 ANG MO KIO INDL. PK 2, WAREHOUSE ~ SG KADUT #07, 7TH STOREY, SINGAPORE 569500\n\n## assigned codes\n\n**account code:** DG000008\n\n**salesman:** SD007\n\n**terms:** Net EOM\n\n## handwritten annotations\n\n- L.RRAPLASTICSINDUSTRIES+EVTLTD\n- 恒昇塑膠工业私艺）有限公司\n- Quality Assurance\n- wwwerl m\n- VOTNUMBER: TAX INVOICE\n- DATE\n- ILL TO\n- A/C CODE P.O. NUMBEr TERMS SALESMAN\n- T NO. PARTICULARS QUANTITY UNIT PRICE AMOUNT\n- cheques should be crossed. made payable to \"EVERRISE ,4I * INDUSTRIES (PTE) LTD\" SUB TOTAL\n- 26076386:1\n- FINANCE DEPARTMENT\n- ADD GST G%\n- TOTAL\n- 「EVERRISEPLASTICSINDUSTRIES(PTE)LTD\n- SIGNATURE&COMPANYSTAMP ISSUED BY\n- 11 Marsiling Industrial Estale Roa(d One, #01-31, Singapore 739277 Tel: (65) 6269 9442 Fax: (65) 6367 8771\n\n## line items\n\n| t_no | particulars | quantity | unit | price | amount |\n| --- | --- | --- | --- | --- | --- |\n|  | E FLASTICS |  |  |  | 1812.85 |\n|  |  |  |  | 163.16 | 18 |\n\n## handwritten notes\n\n- [unreadable]\n- [unreadable]\n- L.RRAPLASTICSINDUSTRIES+EVTLTD\n- 恒昇塑膠工业私艺）有限公司\n- Quality Assurance\n- wwwerl m\n- VOTNUMBER: TAX INVOICE\n- [non-text region]\n- DATE\n- ILL TO\n- A/C CODE P.O. NUMBEr TERMS SALESMAN\n- T NO. PARTICULARS QUANTITY UNIT PRICE AMOUNT\n- [unreadable]\n- [unreadable]\n- cheques should be crossed. made payable to \"EVERRISE ,4I *  INDUSTRIES (PTE) LTD\" SUB TOTAL\n- 26076386:1\n- FINANCE DEPARTMENT\n- ADD GST G%\n- TOTAL\n- 「EVERRISEPLASTICSINDUSTRIES(PTE)LTD\n- SIGNATURE&COMPANYSTAMP ISSUED BY\n- 11 Marsiling Industrial Estale Roa(d One, #01-31, Singapore 739277 Tel: (65) 6269 9442 Fax: (65) 6367 8771\n\n**job id:** d8a0a9a5-9c4d-4e01-8da5-3d2863d6f390\n\n**source:** 2897_001_p4.pdf\n\n**submitted by:** admin@nanowaka.io\n\n**mean confidence:** 76.3\n\n**extracted at:** 2026-10-13T08:05:42.857Z\n\n**the 9:** s$163.16\n\n**doc id:** 00287864\n\n**po ref:** PO-TB10084367",
+  "doc_type": "Invoice",
+  "attachment": "05-Invoices/00287864.pdf",
+  "ocr": "05-Invoices/00287864.ocr.md"
+}

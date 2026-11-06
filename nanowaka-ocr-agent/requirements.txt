@@ -1,0 +1,9 @@
+# ADK:  pip install -e /opt/v6/byoa_adk_final
+flask
+waitress
+pymupdf
+pillow
+transformers==5.17.0
+accelerate
+flash-linear-attention   # fast kernels for the Qwen3.5 linear-attention layers
+# torch + torchvision: CUDA build for your machine (this box: torch 2.14.1+cu130, torchvision 0.29.1)

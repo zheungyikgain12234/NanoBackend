@@ -1,0 +1,516 @@
+"""
+BYOA Knowledge Retrieve Agent -- standalone GX10 service.
+
+Reads from the same ChromaDB store that the ingestion service
+(chromadb_ingest_service.py, deployed as byoa-rag-ingest3) writes to --
+read-only from this agent's perspective, no ingestion logic here.
+
+Unlike the ingestion service, this IS wrapped as a normal byoa_adk Agent
+(capability: "knowledge-retrieve"), since retrieval is pure JSON
+query-in/results-out and fits the existing Agent/TaskPayload pattern
+cleanly -- no file upload involved, so there's no reason to bypass the ADK
+the way ingestion had to.
+
+Embeddings: vLLM only (both this agent's query-side embedding and the
+ingestion service's document-side embedding) -- MUST stay the same
+backend/model as chromadb_ingest_service.py, or vectors won't be
+comparable in the same collection. Ollama is being phased out
+platform-wide; no Ollama calls remain in this agent.
+
+Session scoping: an optional `session_id` input restricts the ChromaDB
+query to only chunks tagged with that session_id at ingest time (see
+chromadb_ingest_service.py's /ingest, which accepts a session_id form
+field). Used by the platform controller for goal-attached file uploads,
+so a question about an uploaded file doesn't get diluted by unrelated
+content already sitting in the shared knowledge base. Omitting session_id
+searches the entire collection as before.
+
+fetch_all mode: an optional `fetch_all` boolean input (requires
+session_id) bypasses similarity search/ranking entirely and directly
+fetches every chunk tagged with that session_id via ChromaDB's metadata
+filter, sorted back into original document order (chunk_index) and
+joined into a single `full_text` output field. This exists because
+similarity search is the wrong tool for "summarize the whole document"
+style goals against a large upload: a query like "summarize the document
+X.pdf" has almost no semantic overlap with the document's actual content,
+so it scores low and legitimately-present content gets reported as
+fallback_recommended even though it's genuinely there. fetch_all sidesteps
+that mismatch -- there's no ranking or threshold to fail. The single
+full_text field also sidesteps a structural limitation of the platform
+controller's $task_N.path reference syntax: it only supports static,
+literal indices (results[0], results[1], ...) baked into the plan before
+execution, so a downstream task can't dynamically reference "all N
+chunks" when N (the chunk count) isn't known until this task actually
+runs -- $task_N.full_text is one static reference regardless of how many
+chunks the document has, the same pattern already used for small,
+inlined uploads ($task_9001.text, see platform_controller.py).
+
+Fallback design: this agent does NOT call the websearch agent itself, and
+doesn't decide on its own to skip the knowledge base. It always searches
+and always returns its own confidence signal --
+`fallback_recommended` + `fallback_reason` -- so the platform controller's
+Goal Expander can decide whether to *also* dispatch a websearch task, and
+can explain *why* it did so, rather than silently switching sources.
+
+Same .env-configurable / systemd / cloudflared conventions as every other
+BYOA service on this box.
+
+PERFORMANCE NOTE: the ChromaDB HttpClient is now created once at
+import time and cached, instead of being reconstructed on every single
+/run call. Measured locally: ~4x faster for the client-construction step
+alone. Be aware this is a modest ABSOLUTE saving (a few ms), not the
+explanation for the large
+request-to-request latency swings seen in production -- those are almost
+certainly vLLM embedding-inference time varying with GPU contention
+across the shared v1/v2/v3 stacks, which this change does nothing to fix.
+The collection object is still re-fetched from the cached client on every
+call (cheap -- an in-memory lookup against an already-open client, not a
+fresh file open), which sidesteps needing to assert this chromadb version's
+collection objects are safe to share across waitress's worker threads.
+If a newly-ingested document ever doesn't show up in retrieval results
+without restarting this service, that would indicate the cached client
+isn't picking up the ingestion service's writes promptly -- worth an
+explicit test (ingest something new while this stays running, then query
+for it) before trusting this long-term, since two separate processes are
+writing to and reading from the same on-disk store.
+"""
+import os
+
+import requests as _req
+from dotenv import load_dotenv
+from waitress import serve
+
+from byoa_adk import Agent, DAG, Step
+from byoa_adk.schema import TaskPayload, TaskResult, TaskStatus
+from byoa_adk.server import build_flask_app
+
+load_dotenv()
+
+PORT = int(os.environ.get("PORT", "7406"))
+BYOA_SECRET = os.environ.get("BYOA_SECRET", "byoa-dev-secret-change-in-prod")
+os.environ["BYOA_SECRET"] = BYOA_SECRET
+AGENT_ENDPOINT = os.environ.get("AGENT_ENDPOINT", "https://retrieve3.zackloh.dev")
+
+CHROMA_DB_PATH = os.environ.get("CHROMA_DB_PATH", "/opt/byoa-rag-ingest3/chroma_data")
+# The ChromaDB store is now owned by exactly one process: the standalone
+# `chroma run` server (byoa-chromadb6.service). This service must NOT open
+# its own direct PersistentClient onto CHROMA_DB_PATH's sqlite file --
+# chromadb_ingest_service.py needs access to the same data, and two
+# processes each independently holding a PersistentClient on the same
+# on-disk store was the dual-writer bug that made ingested documents
+# invisible to retrieval.
+CHROMADB_SERVER_HOST = os.environ.get("CHROMADB_SERVER_HOST", "localhost")
+CHROMADB_SERVER_PORT = int(os.environ.get("CHROMADB_SERVER_PORT", "4420"))
+CHROMA_COLLECTION = os.environ.get("CHROMA_COLLECTION", "company_docs")
+
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:11501")
+VLLM_EMBED_MODEL = os.environ.get("VLLM_EMBED_MODEL", "qwen3-embedding-8b")
+
+DEFAULT_TOP_K = int(os.environ.get("DEFAULT_TOP_K", "5"))
+# Cap on how much text a fetch_all=true request (see run()) will return in
+# full_text -- protects downstream summarize-agent calls (and the LLM
+# context window) from an unbounded blob for a very large document. If
+# exceeded, full_text is truncated with a note appended rather than silently
+# cut off.
+MAX_FETCH_ALL_CHARS = int(os.environ.get("MAX_FETCH_ALL_CHARS", "40000"))
+# Started at 0.55 as an untested guess. First real test against actual
+# ingested data (a correctly-retrieved chunk containing the exact answer
+# still only scored 0.44, partly due to a chunking issue since fixed, partly
+# because terse/list-like factual content just scores lower than clean
+# prose against a query). Lowered to reflect that -- treat this as a
+# starting point to keep tuning as more real queries come in, not a
+# permanent number.
+DEFAULT_MIN_SIMILARITY = float(os.environ.get("DEFAULT_MIN_SIMILARITY", "0.40"))
+
+# qwen3-embedding is an asymmetric retrieval model: per Alibaba's own model
+# card (huggingface.co/Qwen/Qwen3-Embedding-8B), omitting an instruction
+# prefix on the QUERY side measurably hurts retrieval accuracy -- documents
+# intentionally get no prefix ("No need to add instruction for retrieval
+# documents"), which is why the ingestion service's embed_texts() is
+# correctly left as plain text and only this side changes.
+QUERY_INSTRUCT_TASK = os.environ.get(
+    "QUERY_INSTRUCT_TASK",
+    "Given a search query, retrieve relevant passages from the company "
+    "knowledge base that answer the query",
+)
+
+# Reused across calls instead of a fresh connection per request -- avoids
+# repeated TCP setup overhead to the same local vLLM endpoint. Safe: no
+# per-request state is stored on the session itself.
+_http_session = _req.Session()
+
+
+def embed_query(text: str) -> list:
+    instructed_query = f"Instruct: {QUERY_INSTRUCT_TASK}\nQuery:{text}"
+    r = _http_session.post(
+        f"{VLLM_BASE_URL}/v1/embeddings",
+        json={"model": VLLM_EMBED_MODEL, "input": instructed_query},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["data"][0]["embedding"]
+
+
+# Created once at import time and reused -- see PERFORMANCE NOTE above.
+_chroma_client = None
+
+
+def _get_chroma_client():
+    global _chroma_client
+    if _chroma_client is None:
+        import chromadb
+        _chroma_client = chromadb.HttpClient(host=CHROMADB_SERVER_HOST, port=CHROMADB_SERVER_PORT)
+    return _chroma_client
+
+
+def get_collection():
+    client = _get_chroma_client()
+    # metadata here only matters if this process somehow gets to the
+    # collection before the ingestion service ever creates it -- normally
+    # ingestion is what actually establishes the collection (and its
+    # cosine space). Included for symmetry/safety, not because this agent
+    # expects to be first. Cheap: an in-memory lookup against the
+    # already-open client, not a fresh file open.
+    return client.get_or_create_collection(CHROMA_COLLECTION, metadata={"hnsw:space": "cosine"})
+
+
+class KnowledgeRetrieveAgent(Agent):
+    """
+    Embeds a query, searches the company-docs ChromaDB collection, and
+    returns the top matching chunks with similarity scores. Also reports
+    whether the platform should fall back to web search -- and why -- when
+    nothing found is a confident match.
+    """
+    name = "byoa-knowledge-retrieve-agent"
+    version = "1.0.0"
+    description = ("Searches whatever documents have been uploaded into this "
+                   "platform's internal knowledge base and returns the most "
+                   "relevant passages for a query -- covering any topic "
+                   "those documents contain, not just company/business "
+                   "content. Useful for any factual or informational "
+                   "question where the answer might already be sitting in "
+                   "an ingested document, before falling back to a live web "
+                   "search. Accepts an optional session_id to scope the "
+                   "search to only documents uploaded under that session "
+                   "(e.g. files attached to the current goal), rather than "
+                   "the entire knowledge base. Also accepts an optional "
+                   "fetch_all flag (requires session_id) that bypasses "
+                   "similarity search entirely and returns the ENTIRE "
+                   "session's content, in original document order, as a "
+                   "single full_text field -- use this instead of a normal "
+                   "similarity query for goals asking to summarize/describe "
+                   "a WHOLE uploaded document, since a query like 'summarize "
+                   "the document' has little semantic overlap with the "
+                   "document's actual content and will otherwise score low "
+                   "or trigger a false fallback recommendation. Reports a "
+                   "fallback_recommended flag (with a plain-language reason) "
+                   "when nothing found is a confident match (or, in "
+                   "fetch_all mode, when nothing has been ingested under that "
+                   "session_id yet), so the caller knows to try elsewhere "
+                   "and can explain why.")
+    capabilities = ["knowledge-retrieve"]
+
+    dag = DAG([
+        Step("embed_query", depends_on=[], description="Embed the query text"),
+        Step("search", depends_on=["embed_query"], description="Query ChromaDB for nearest chunks"),
+        Step("assess", depends_on=["search"], description="Decide fallback recommendation"),
+    ])
+
+    def run(self, payload: TaskPayload) -> TaskResult:
+        query = str(payload.inputs.get("query", "")).strip()
+        fetch_all = bool(payload.inputs.get("fetch_all", False))
+
+        session_id = payload.inputs.get("session_id")
+        session_id = str(session_id).strip() if session_id else None
+        has_where_filter = bool(session_id)
+
+        # Optional: scopes fetch_all (see below) to ONE specific document
+        # within the session, rather than every document tagged with that
+        # session_id. Without this, a session with multiple uploaded files
+        # (e.g. "compare the two") has no way to fetch just one of them --
+        # every fetch_all call for that session returns ALL files in it
+        # merged together, regardless of which file the caller intended.
+        # Not used outside fetch_all mode -- similarity search already
+        # naturally surfaces the most relevant chunks across a session's
+        # documents without needing a hard per-document filter.
+        doc_id = payload.inputs.get("doc_id")
+        doc_id = str(doc_id).strip() if doc_id else None
+
+        # fetch_all mode: for "summarize the whole document" style goals
+        # against a large upload (too big to inline -- see the platform
+        # controller's rule 0), similarity search is the wrong tool.
+        # "summarize the document X.pdf" has almost no semantic overlap
+        # with the document's actual content, so it scores low and
+        # legitimately-present content gets reported as fallback_recommended
+        # even though the document IS there. fetch_all bypasses ranking
+        # entirely: a direct metadata-filtered fetch of every chunk tagged
+        # with this session_id, no query embedding computed, no
+        # min_similarity threshold applied. Requires session_id -- fetching
+        # the ENTIRE shared knowledge base at once (no session scope) isn't
+        # supported, and almost certainly isn't what was intended.
+        if fetch_all:
+            if not session_id:
+                return TaskResult(task_id=payload.task_id,
+                                  status=TaskStatus.FAILURE,
+                                  error_msg=("fetch_all requires session_id -- fetching the entire "
+                                             "shared knowledge base at once isn't supported"))
+            try:
+                collection = get_collection()
+                # ChromaDB's flat multi-key dict form for `where` isn't
+                # consistent across versions -- the explicit "$and" list
+                # form is valid everywhere, so always use it once doc_id
+                # narrows the filter beyond session_id alone.
+                where_filter = (
+                    {"$and": [{"session_id": session_id}, {"doc_id": doc_id}]}
+                    if doc_id else
+                    {"session_id": session_id}
+                )
+                raw = collection.get(where=where_filter, include=["documents", "metadatas"])
+                raw = raw or {}
+                ids = raw.get("ids") or []
+                docs = raw.get("documents") or []
+                metas = raw.get("metadatas") or []
+            except Exception as e:
+                # Same ChromaDB/hnswlib quirk as the semantic-search path
+                # below can show up here too (a metadata filter matching
+                # zero items on a small collection) -- same treatment:
+                # zero results, not a hard failure.
+                err_text = str(e).lower()
+                if "error finding id" in err_text or "error executing plan" in err_text:
+                    ids, docs, metas = [], [], []
+                else:
+                    return TaskResult(task_id=payload.task_id,
+                                      status=TaskStatus.FAILURE,
+                                      error_msg=f"ChromaDB fetch failed: {e}")
+
+            chunks = []
+            for chunk_id, text, meta in zip(ids, docs, metas):
+                meta = meta or {}
+                chunks.append({
+                    "chunk_id": chunk_id,
+                    "text": text,
+                    "similarity": None,  # not applicable -- fetched directly, not ranked
+                    "doc_id": meta.get("doc_id"),
+                    "source": meta.get("source"),
+                    "chunk_type": meta.get("chunk_type"),
+                    "section_path": meta.get("section_path"),
+                    "chunk_index": meta.get("chunk_index"),
+                })
+            # Reading order matters for a coherent whole-document summary --
+            # there's no relevance ranking in this mode, so sort by original
+            # position in the document instead of similarity.
+            chunks.sort(key=lambda c: c["chunk_index"] if c["chunk_index"] is not None else 0)
+
+            full_text = "\n\n".join(c["text"] for c in chunks if c["text"])
+            truncated = False
+            if len(full_text) > MAX_FETCH_ALL_CHARS:
+                full_text = full_text[:MAX_FETCH_ALL_CHARS] + "\n\n[... truncated, document continues beyond this point ...]"
+                truncated = True
+
+            if not chunks:
+                fallback_recommended = True
+                fallback_reason = (
+                    f"No chunks matching doc_id={doc_id!r} were found for this session's uploads."
+                    if doc_id else
+                    "No documents matching this session's uploads have been ingested yet."
+                )
+            else:
+                fallback_recommended = False
+                fallback_reason = None
+
+            return TaskResult(
+                task_id=payload.task_id,
+                status=TaskStatus.SUCCESS,
+                outputs={
+                    "query": query or None,
+                    "results": chunks,
+                    "full_text": full_text,
+                    "truncated": truncated,
+                    "best_similarity": None,
+                    "fallback_recommended": fallback_recommended,
+                    "fallback_reason": fallback_reason,
+                },
+            )
+
+        if not query:
+            return TaskResult(task_id=payload.task_id,
+                              status=TaskStatus.FAILURE,
+                              error_msg="inputs.query is required")
+
+        try:
+            top_k = int(payload.inputs.get("top_k", DEFAULT_TOP_K))
+        except (TypeError, ValueError):
+            top_k = DEFAULT_TOP_K
+        top_k = max(1, min(top_k, 50))
+
+        try:
+            min_similarity = float(payload.inputs.get("min_similarity", DEFAULT_MIN_SIMILARITY))
+        except (TypeError, ValueError):
+            min_similarity = DEFAULT_MIN_SIMILARITY
+
+        try:
+            query_vec = embed_query(query)
+        except Exception as e:
+            return TaskResult(task_id=payload.task_id,
+                              status=TaskStatus.FAILURE,
+                              error_msg=f"Embedding the query failed: {e}")
+
+        try:
+            collection = get_collection()
+            query_kwargs = {
+                "query_embeddings": [query_vec],
+                "n_results": top_k,
+                "include": ["documents", "metadatas", "distances"],
+            }
+            # Scopes the search to just this goal's uploaded doc(s) instead
+            # of the whole knowledge base, when the caller supplies one.
+            # Docs ingested without a session_id (i.e. everything that
+            # isn't a goal-attached upload) simply have no session_id key
+            # at all, so this filter naturally excludes them too -- it's
+            # never accidentally matching an empty/None value.
+            if has_where_filter:
+                query_kwargs["where"] = {"session_id": session_id}
+            raw = collection.query(**query_kwargs)
+            # Some ChromaDB versions return None (rather than raising) for
+            # edge cases like a near-empty/freshly-created collection --
+            # treat that as "zero results" rather than crashing on the next
+            # line's .get() call. Keeping this INSIDE the try block (unlike
+            # the previous version of this code) means any such anomaly
+            # becomes a clean FAILURE below, not an unhandled crash that
+            # bypasses our error handling entirely.
+            raw = raw or {}
+            ids = raw.get("ids") or [[]]
+            docs = raw.get("documents") or [[]]
+            metas = raw.get("metadatas") or [[]]
+            dists = raw.get("distances") or [[]]
+            ids, docs, metas, dists = ids[0], docs[0], metas[0], dists[0]
+        except Exception as e:
+            # ChromaDB/hnswlib has a documented quirk: a `where` metadata
+            # filter that matches zero (or very few) items on a small
+            # collection can raise an internal index error ("Error
+            # executing plan: ... Error finding id" or similar) instead of
+            # cleanly returning empty results. Functionally this IS "no
+            # matches for this filter" -- e.g. a session_id nothing has
+            # been ingested under yet -- so when a where filter was active,
+            # treat this class of error as zero results (falls through to
+            # the normal fallback_recommended path below) rather than
+            # failing the task outright, which would otherwise cascade
+            # into every task downstream that depends on this one. A
+            # genuine embedding/connection failure still isn't caught by
+            # this narrow check and fails loudly as before.
+            err_text = str(e).lower()
+            looks_like_empty_filter_quirk = (
+                has_where_filter
+                and ("error finding id" in err_text or "error executing plan" in err_text)
+            )
+            if not looks_like_empty_filter_quirk:
+                return TaskResult(task_id=payload.task_id,
+                                  status=TaskStatus.FAILURE,
+                                  error_msg=f"ChromaDB query failed: {e}")
+            ids, docs, metas, dists = [], [], [], []
+
+        # Cosine space in Chroma reports *distance* = 1 - cosine_similarity,
+        # so similarity is recovered as 1 - distance.
+        results = []
+        for chunk_id, text, meta, dist in zip(ids, docs, metas, dists):
+            meta = meta or {}  # defend against a per-chunk None metadata entry
+            results.append({
+                "chunk_id": chunk_id,
+                "text": text,
+                "similarity": round(1 - dist, 4),
+                "doc_id": meta.get("doc_id"),
+                "source": meta.get("source"),
+                "chunk_type": meta.get("chunk_type"),
+                "section_path": meta.get("section_path"),
+            })
+
+        results.sort(key=lambda r: r["similarity"], reverse=True)
+        best_similarity = results[0]["similarity"] if results else None
+
+        if not results:
+            fallback_recommended = True
+            fallback_reason = (
+                "No documents matching this session's uploads have been ingested yet."
+                if session_id else
+                "No documents have been ingested into the knowledge base yet."
+            )
+        elif best_similarity < min_similarity:
+            fallback_recommended = True
+            fallback_reason = (
+                f"Best match similarity ({best_similarity:.2f}) fell below the "
+                f"confidence threshold ({min_similarity:.2f}) -- the internal "
+                f"knowledge base likely doesn't cover this topic."
+            )
+        else:
+            fallback_recommended = False
+            fallback_reason = None
+
+        # min_similarity was previously only used to compute the
+        # fallback signal, not to actually filter what got returned -- a
+        # weak, unrelated second-place chunk could ride along with a
+        # strong top match and dilute downstream synthesis. The top match
+        # (if fallback_recommended is False) is always >= min_similarity by
+        # construction, so this can only trim lower-ranked entries, never
+        # drop the one result that matters.
+        results = [r for r in results if r["similarity"] >= min_similarity]
+
+        return TaskResult(
+            task_id=payload.task_id,
+            status=TaskStatus.SUCCESS,
+            outputs={
+                "query": query,
+                "results": results,
+                "best_similarity": best_similarity,
+                "fallback_recommended": fallback_recommended,
+                "fallback_reason": fallback_reason,
+            },
+        )
+
+
+agent = KnowledgeRetrieveAgent()
+
+agent.generate_manifest(
+    endpoint=AGENT_ENDPOINT,
+    input_schema={
+        "query": {"type": "string", "required": True},
+        "top_k": {"type": "integer", "required": False},
+        "min_similarity": {"type": "number", "required": False},
+        "session_id": {"type": "string", "required": False},
+        "fetch_all": {"type": "boolean", "required": False},
+        "doc_id": {"type": "string", "required": False},
+    },
+    output_schema={
+        "type": "object",
+        "properties": {
+            # Only None in fetch_all mode when no query text was supplied
+            # (fetch_all bypasses the query entirely) -- see `query or None`
+            # in the fetch_all branch above.
+            "query": {"type": "string", "nullable": True},
+            "results": {"type": "array"},
+            # Only present at all in the fetch_all branch -- the normal
+            # semantic-search branch has no single full_text field.
+            "full_text": {"type": "string", "required": False},
+            "truncated": {"type": "boolean", "required": False},
+            # None whenever there are zero results to rank (both branches).
+            "best_similarity": {"type": "number", "nullable": True},
+            "fallback_recommended": {"type": "boolean"},
+            # None on the confident-match path, in both branches.
+            "fallback_reason": {"type": "string", "nullable": True},
+        },
+    },
+)
+
+app = build_flask_app(agent, BYOA_SECRET)
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print(f"Knowledge Retrieve Agent -- {agent.name} v{agent.version}")
+    print("=" * 60)
+    print(f"  Listening on : http://0.0.0.0:{PORT}")
+    print(f"  Public via   : {AGENT_ENDPOINT} (cloudflared, managed by systemd)")
+    print(f"  Chroma path  : {CHROMA_DB_PATH} (collection: {CHROMA_COLLECTION}, read-only usage)")
+    print(f"  GET  {AGENT_ENDPOINT}/health")
+    print(f"  GET  {AGENT_ENDPOINT}/agent.md")
+    print(f"  POST {AGENT_ENDPOINT}/run")
+    print("=" * 60)
+    serve(app, host="0.0.0.0", port=PORT, threads=4)

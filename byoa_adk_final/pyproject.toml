@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "byoa-adk"
+version = "1.1.1"
+description = "BYOA Agent Development Kit -- build, secure, and serve agents for the BYOA platform."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+
+dependencies = [
+    "flask>=3.0",
+    "pydantic>=2.0",
+    "PyJWT>=2.8",
+    "requests>=2.31",
+    "click>=8.1",
+]
+
+[project.optional-dependencies]
+# Only needed if an agent sets AUDIT_DB_URL to use the Postgres-backed
+# audit log. Agents that stay on file-only audit logging don't need this.
+postgres-audit = ["psycopg2-binary>=2.9"]
+
+# Everything needed to run the ADK's own test suite (test_agent.py,
+# test_health.py, test_security_mechanisms.py).
+test = ["pytest>=7.0"]
+
+[project.scripts]
+# Installing this package puts a real `byoa-adk` command on PATH,
+# backed by the click group defined in byoa_adk/cli.py.
+byoa-adk = "byoa_adk.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["byoa_adk*"]

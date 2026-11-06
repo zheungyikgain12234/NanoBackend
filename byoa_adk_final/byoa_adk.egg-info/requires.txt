@@ -1,0 +1,11 @@
+flask>=3.0
+pydantic>=2.0
+PyJWT>=2.8
+requests>=2.31
+click>=8.1
+
+[postgres-audit]
+psycopg2-binary>=2.9
+
+[test]
+pytest>=7.0

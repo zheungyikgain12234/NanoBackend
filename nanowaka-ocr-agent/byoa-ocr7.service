@@ -1,0 +1,18 @@
+# /etc/systemd/system/byoa-ocr7.service
+[Unit]
+Description=BYOA v7 - nanowaka-fin-ocr-agent
+After=network.target
+
+[Service]
+Type=simple
+User=zheungyik
+WorkingDirectory=/opt/v6/nanowaka-ocr-agent
+EnvironmentFile=/opt/v6/nanowaka-ocr-agent/.env
+ExecStart=/opt/v6/nanowaka-ocr-agent/venv/bin/python3 /opt/v6/nanowaka-ocr-agent/ocr_agent.py
+Restart=on-failure
+RestartSec=5
+# model load takes ~1 min before the port opens
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

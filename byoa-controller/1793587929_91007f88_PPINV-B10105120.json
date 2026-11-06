@@ -1,0 +1,76 @@
+{
+  "doc_id": "PPINV-B10105120",
+  "doc_type": "Invoice",
+  "tags": [],
+  "po_ref": "PO-TB10084368",
+  "invoice_date": "2026-07-13T00:00:00.000Z",
+  "invoice_amount": 1498.6,
+  "amount_excl_vat": 1374.86,
+  "vendor_invoice_no": "00288360",
+  "line_items": [
+    {
+      "lineNo": 10000,
+      "orderLineNo": 10000,
+      "itemNo": "T0150095",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 340,
+      "lineAmount": 659.6
+    },
+    {
+      "lineNo": 20000,
+      "orderLineNo": 20000,
+      "itemNo": "T0149905",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "lineAmount": 0
+    },
+    {
+      "lineNo": 30000,
+      "orderLineNo": 30000,
+      "itemNo": "T0149906",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "lineAmount": 0
+    },
+    {
+      "lineNo": 40000,
+      "orderLineNo": 40000,
+      "itemNo": "T0148032",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "lineAmount": 0
+    },
+    {
+      "lineNo": 50000,
+      "orderLineNo": 50000,
+      "itemNo": "T0151135",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 78,
+      "lineAmount": 715.26
+    },
+    {
+      "lineNo": 60000,
+      "orderLineNo": 60000,
+      "itemNo": "T0148034",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "lineAmount": 0
+    },
+    {
+      "lineNo": 70000,
+      "orderLineNo": 70000,
+      "itemNo": "",
+      "description": "",
+      "quantity": 0,
+      "lineAmount": 0
+    },
+    {
+      "lineNo": 80000,
+      "orderLineNo": 80000,
+      "itemNo": "",
+      "description": "ATTN: SAHIN",
+      "quantity": 0,
+      "lineAmount": 0
+    }
+  ]
+}

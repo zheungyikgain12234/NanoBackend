@@ -1,0 +1,2 @@
+
+Extract all readable content from the image in natural human reading order and output the result as a single Markdown document. Format formulas as LaTeX. Format tables as Markdown tables. Transcribe all other text as standard Markdown. Preserve the original text without translation or paraphrasing.

@@ -1,0 +1,10 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.log
+chroma_data/
+*.sqlite3
+node_modules/
+.dart_tool/
+build/

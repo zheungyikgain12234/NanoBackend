@@ -1,0 +1,46 @@
+{
+  "job_id": "76363777-f1d2-4a8a-b307-81531c9b0f24",
+  "conversation_id": "27eee75d227941839954465bdae87489",
+  "timestamp": 1793587728.3421743,
+  "goal": "match",
+  "expanded_tasks": [
+    {
+      "task_id": 1,
+      "task_description": "Match the PO, GRNs, and Invoices to verify quantities and amounts across documents",
+      "agent_id": "json-match-agent",
+      "inputs": {
+        "documents": [
+          "$task_9002.json",
+          "$task_9009.json",
+          "$task_9010.json",
+          "$task_9011.json",
+          "$task_9012.json",
+          "$task_9013.json",
+          "$task_9014.json",
+          "$task_9015.json",
+          "$task_9016.json",
+          "$task_9017.json",
+          "$task_9018.json",
+          "$task_9019.json",
+          "$task_9020.json",
+          "$task_9021.json",
+          "$task_9022.json",
+          "$task_9023.json",
+          "$task_9024.json",
+          "$task_9025.json",
+          "$task_9026.json",
+          "$task_9027.json",
+          "$task_9001.json",
+          "$task_9003.json",
+          "$task_9004.json",
+          "$task_9005.json",
+          "$task_9006.json",
+          "$task_9007.json",
+          "$task_9008.json",
+          "$task_9028.json"
+        ]
+      },
+      "depends_on": []
+    }
+  ]
+}

@@ -1,0 +1,269 @@
+{
+  "info": {
+    "name": "nanowaka-fin-ocr-agent",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "https://ocr7.zackloh.dev"
+    },
+    {
+      "key": "secret",
+      "value": "PASTE BYOA_SECRET FROM .env"
+    },
+    {
+      "key": "job_id",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Health",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "health"
+          ]
+        }
+      }
+    },
+    {
+      "name": "2. Upload PDF(s) -> job_id (async, default)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-Api-Key",
+            "value": "{{secret}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/ocr",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "ocr"
+          ],
+          "query": []
+        },
+        "description": "Body > form-data > key 'file' (type File); add several rows for multiple PDFs. Returns job_id (stored in {{job_id}}). Then run request 3.",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.collectionVariables.set('job_id', pm.response.json().job_id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Poll job (repeat until status = done)",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "X-Api-Key",
+            "value": "{{secret}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/ocr_status/{{job_id}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "ocr_status",
+            "{{job_id}}"
+          ]
+        }
+      }
+    },
+    {
+      "name": "4. Upload PDF(s) - blocking (short PDFs only)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "X-Api-Key",
+            "value": "{{secret}}"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/ocr",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "ocr"
+          ],
+          "query": [
+            {
+              "key": "async",
+              "value": "false"
+            }
+          ]
+        },
+        "description": "Waits for the result (~30s/page). Risks the ~100s edge timeout on long PDFs.",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "5. ADK /run - server-side directory (HMAC)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// HMAC-SHA256 over task_id:goal_id:capability:timestamp, same as byoa_adk.security.sign_request",
+              "const taskId = 'pm-' + Date.now();",
+              "const goalId = 'goal-' + Date.now();",
+              "const cap = 'text-extract';",
+              "const ts = Math.floor(Date.now() / 1000);",
+              "const sig = CryptoJS.HmacSHA256(`${taskId}:${goalId}:${cap}:${ts}`, pm.collectionVariables.get('secret')).toString();",
+              "pm.collectionVariables.set('task_id', taskId);",
+              "pm.collectionVariables.set('goal_id', goalId);",
+              "pm.collectionVariables.set('ts', ts);",
+              "pm.collectionVariables.set('sig', sig);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/run",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "run"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"task_id\": \"{{task_id}}\",\n  \"goal_id\": \"{{goal_id}}\",\n  \"capability\": \"text-extract\",\n  \"timestamp\": {{ts}},\n  \"hmac_sig\": \"{{sig}}\",\n  \"timeout_secs\": 600,\n  \"inputs\": {\n    \"directory\": \"~/Documents/testOvis_1page\"\n  }\n}"
+        }
+      }
+    },
+    {
+      "name": "6. ADK /run_async - server-side path (HMAC) -> job_id",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// HMAC-SHA256 over task_id:goal_id:capability:timestamp, same as byoa_adk.security.sign_request",
+              "const taskId = 'pm-' + Date.now();",
+              "const goalId = 'goal-' + Date.now();",
+              "const cap = 'text-extract';",
+              "const ts = Math.floor(Date.now() / 1000);",
+              "const sig = CryptoJS.HmacSHA256(`${taskId}:${goalId}:${cap}:${ts}`, pm.collectionVariables.get('secret')).toString();",
+              "pm.collectionVariables.set('task_id', taskId);",
+              "pm.collectionVariables.set('goal_id', goalId);",
+              "pm.collectionVariables.set('ts', ts);",
+              "pm.collectionVariables.set('sig', sig);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('202 accepted', () => pm.response.to.have.status(202));",
+              "pm.collectionVariables.set('job_id', pm.response.json().job_id);"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/run_async",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "run_async"
+          ]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"task_id\": \"{{task_id}}\",\n  \"goal_id\": \"{{goal_id}}\",\n  \"capability\": \"text-extract\",\n  \"timestamp\": {{ts}},\n  \"hmac_sig\": \"{{sig}}\",\n  \"timeout_secs\": 600,\n  \"inputs\": {\n    \"paths\": [\n      \"~/Documents/testOvis_1page/ingram_page1.pdf\"\n    ]\n  }\n}"
+        }
+      }
+    },
+    {
+      "name": "6b. Poll /run_async job (repeat until status = done)",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/status/{{job_id}}",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "status",
+            "{{job_id}}"
+          ]
+        },
+        "description": "No auth needed. status: running -> done. Markdown is at result.outputs.results[0].markdown"
+      }
+    },
+    {
+      "name": "7. Agent.md",
+      "request": {
+        "method": "GET",
+        "url": {
+          "raw": "{{baseUrl}}/agent.md",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "agent.md"
+          ]
+        }
+      }
+    }
+  ]
+}

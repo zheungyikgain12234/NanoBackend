@@ -1,0 +1,92 @@
+{
+  "doc_id": "GRN-B10098924",
+  "doc_type": "GRN",
+  "tags": [],
+  "po_ref": "PO-TB10084367",
+  "received_date": "2026-06-02T00:00:00.000Z",
+  "qty_received": 272,
+  "status": "posted",
+  "vendor_shipment_no": "",
+  "line_items": [
+    {
+      "lineNo": 10000,
+      "orderLineNo": 10000,
+      "itemNo": "T0150095",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "unitOfMeasure": "UNIT",
+      "unitCost": 1.94,
+      "quantityInvoiced": 0
+    },
+    {
+      "lineNo": 20000,
+      "orderLineNo": 20000,
+      "itemNo": "T0149905",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 230.00000000000003,
+      "unitOfMeasure": "UNIT",
+      "unitCost": 4.16,
+      "quantityInvoiced": 230.00000000000003
+    },
+    {
+      "lineNo": 30000,
+      "orderLineNo": 30000,
+      "itemNo": "T0149906",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "unitOfMeasure": "UNIT",
+      "unitCost": 5.57,
+      "quantityInvoiced": 0
+    },
+    {
+      "lineNo": 40000,
+      "orderLineNo": 40000,
+      "itemNo": "T0148032",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "unitOfMeasure": "UNIT",
+      "unitCost": 7.18,
+      "quantityInvoiced": 0
+    },
+    {
+      "lineNo": 50000,
+      "orderLineNo": 50000,
+      "itemNo": "T0151135",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 42,
+      "unitOfMeasure": "LT",
+      "unitCost": 9.17,
+      "quantityInvoiced": 42
+    },
+    {
+      "lineNo": 60000,
+      "orderLineNo": 60000,
+      "itemNo": "T0148034",
+      "description": "SUPERJET UPVC TRUNKING",
+      "quantity": 0,
+      "unitOfMeasure": "UNIT",
+      "unitCost": 10.66,
+      "quantityInvoiced": 0
+    },
+    {
+      "lineNo": 70000,
+      "orderLineNo": 70000,
+      "itemNo": "",
+      "description": "",
+      "quantity": 0,
+      "unitOfMeasure": "",
+      "unitCost": 0,
+      "quantityInvoiced": 0
+    },
+    {
+      "lineNo": 80000,
+      "orderLineNo": 80000,
+      "itemNo": "",
+      "description": "ATTN: SAHIN",
+      "quantity": 0,
+      "unitOfMeasure": "",
+      "unitCost": 0,
+      "quantityInvoiced": 0
+    }
+  ]
+}

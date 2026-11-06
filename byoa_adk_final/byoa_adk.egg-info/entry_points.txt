@@ -1,0 +1,2 @@
+[console_scripts]
+byoa-adk = byoa_adk.cli:cli
