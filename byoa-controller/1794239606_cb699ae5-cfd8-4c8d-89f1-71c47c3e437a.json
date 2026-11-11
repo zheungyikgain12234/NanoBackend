@@ -1,0 +1,71 @@
+{
+  "job_id": "cb699ae5-cfd8-4c8d-89f1-71c47c3e437a",
+  "conversation_id": "af0b0e51b1404d17a7104ab981a7f396",
+  "timestamp": 1794239606.7184463,
+  "goal": "Find solar panel news, summarise it and convert 500 USD to SGD",
+  "expanded_tasks": [
+    {
+      "task_id": 1,
+      "task_description": "Search for recent solar panel news",
+      "agent_id": "byoa-websearch-agent",
+      "inputs": {
+        "query": "solar panel news",
+        "min_results": 5
+      },
+      "depends_on": []
+    },
+    {
+      "task_id": 2,
+      "task_description": "Fetch the full page for the top solar panel news result",
+      "agent_id": "byoa-webcrawl-agent",
+      "inputs": {
+        "url": "$task_1.results[0].url"
+      },
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "task_id": 3,
+      "task_description": "Summarise the solar panel news",
+      "agent_id": "byoa-summarize-agent",
+      "inputs": {
+        "text": "$task_2.text",
+        "focus": "Summarize the key points of this solar panel news article concisely."
+      },
+      "depends_on": [
+        2
+      ]
+    },
+    {
+      "task_id": 4,
+      "task_description": "Convert 500 USD to SGD",
+      "agent_id": "fx-agent",
+      "inputs": {
+        "from": "USD",
+        "to": "SGD",
+        "amount": 500
+      },
+      "depends_on": []
+    },
+    {
+      "task_id": 5,
+      "task_description": "Combine the 2 results into the final answer",
+      "agent_id": "byoa-combine-agent",
+      "inputs": {
+        "summaries": [
+          "$task_4",
+          "$task_3"
+        ],
+        "labels": [
+          "Convert 500 USD to SGD",
+          "Summarise the solar panel news"
+        ]
+      },
+      "depends_on": [
+        4,
+        3
+      ]
+    }
+  ]
+}

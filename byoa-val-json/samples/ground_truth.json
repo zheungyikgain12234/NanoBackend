@@ -1,0 +1,11 @@
+{
+  "invoice_no": "INV-2025-0042",
+  "invoice_date": "2025-03-04",
+  "vendor": "ACME Pte Ltd",
+  "currency": "SGD",
+  "items": [
+    {"desc": "Widget", "qty": 2, "unit_price": 10.00, "amount": 20.00},
+    {"desc": "Gadget", "qty": 5, "unit_price": 25.00, "amount": 125.00}
+  ],
+  "total": 145.00
+}

@@ -1,0 +1,3 @@
+byoa-adk>=1.0.0
+python-dotenv
+waitress

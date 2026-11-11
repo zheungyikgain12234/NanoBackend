@@ -1,0 +1,12 @@
+{
+  "reference": "inv-2025-0042",
+  "issued_on": "04 Mar 2025",
+  "supplier": "Acme Pte. Ltd.",
+  "ccy": "Singapore Dollar",
+  "lines": [
+    {"name": "GADGET", "quantity": 5, "price_each": "S$25.00", "line_total": "125.00"},
+    {"name": "Widget", "quantity": 3, "price_each": 10, "line_total": 30}
+  ],
+  "grand_total": "S$155.00",
+  "notes": "extra field, ignored"
+}

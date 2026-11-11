@@ -1,0 +1,4 @@
+byoa-adk>=1.1.1  # local: pip install -e /opt/v6/byoa_adk_final
+requests
+python-dotenv
+waitress

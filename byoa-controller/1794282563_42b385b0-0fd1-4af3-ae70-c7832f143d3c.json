@@ -1,0 +1,18 @@
+{
+  "job_id": "42b385b0-0fd1-4af3-ae70-c7832f143d3c",
+  "conversation_id": "b3ca7289f0bf4a60a05d72a5995e203e",
+  "timestamp": 1794282563.4798205,
+  "goal": "process",
+  "expanded_tasks": [
+    {
+      "task_id": 1,
+      "task_description": "Summarize the content of the uploaded invoice file to extract key details such as amounts, dates, and line items.",
+      "agent_id": "byoa-summarize-agent",
+      "inputs": {
+        "text": "$task_9001.text",
+        "focus": "Extract the total amount, date, and line item details from this invoice. Respond with a concise summary of these key fields."
+      },
+      "depends_on": []
+    }
+  ]
+}

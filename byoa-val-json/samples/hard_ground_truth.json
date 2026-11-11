@@ -1,0 +1,8 @@
+{
+  "order": {"status": "shipped", "priority": "high", "currency": "SGD", "paid": true},
+  "customer": {"name": "Tan Wei Ming", "tier": "gold", "country": "Singapore"},
+  "items": [
+    {"product": "Keyboard", "qty": 2, "price": 40, "discount": 5},
+    {"product": "Mouse", "qty": 3, "price": 15, "discount": 5}
+  ]
+}

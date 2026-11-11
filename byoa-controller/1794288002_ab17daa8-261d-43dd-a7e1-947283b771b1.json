@@ -1,0 +1,18 @@
+{
+  "job_id": "ab17daa8-261d-43dd-a7e1-947283b771b1",
+  "conversation_id": "0f83c280281245ee924e09e315c88900",
+  "timestamp": 1794288002.7317069,
+  "goal": "process",
+  "expanded_tasks": [
+    {
+      "task_id": 1,
+      "task_description": "Summarize the content of the uploaded invoice file",
+      "agent_id": "byoa-summarize-agent",
+      "inputs": {
+        "text": "$task_9001.text",
+        "focus": "Summarize the key details of this invoice, including vendor, date, invoice number, line items, and total amount."
+      },
+      "depends_on": []
+    }
+  ]
+}

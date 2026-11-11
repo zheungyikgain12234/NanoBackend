@@ -891,7 +891,7 @@ def get_feedback_collection():
 
 def store_feedback(goal_text: str, rating: int, comment: str, dag_summary: str,
                     capabilities_used: list, response_excerpt: str, plan_id: str,
-                    conversation_id: str, controller_version: str) -> dict:
+                    thread_id: str, controller_version: str) -> dict:
     """
     Embeds goal_text as a plain document (no instruction prefix -- see
     embed_feedback_query above) and writes one row into feedback memory.
@@ -917,7 +917,7 @@ def store_feedback(goal_text: str, rating: int, comment: str, dag_summary: str,
         "capabilities_used": ",".join(capabilities_used or []),
         "response_excerpt": (response_excerpt or "")[:500],
         "plan_id": plan_id or "",
-        "conversation_id": conversation_id or "",
+        "thread_id": thread_id or "",
         "controller_version": controller_version or "",
         "submitted_at": now,
     }
@@ -1141,7 +1141,7 @@ def submit_feedback():
             capabilities_used=body.get("capabilities_used", []),
             response_excerpt=body.get("response_excerpt", ""),
             plan_id=body.get("plan_id", ""),
-            conversation_id=body.get("conversation_id", ""),
+            thread_id=body.get("thread_id", ""),
             controller_version=body.get("controller_version", ""),
         )
     except Exception as e:
@@ -1241,7 +1241,7 @@ def list_feedback():
             "dag_summary": meta.get("dag_summary", ""),
             "capabilities_used": [c for c in meta.get("capabilities_used", "").split(",") if c],
             "plan_id": meta.get("plan_id", ""),
-            "conversation_id": meta.get("conversation_id", ""),
+            "thread_id": meta.get("thread_id", ""),
             "submitted_at": meta.get("submitted_at", ""),
         })
     rows.sort(key=lambda r: r["submitted_at"], reverse=True)

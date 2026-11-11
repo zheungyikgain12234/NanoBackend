@@ -1,0 +1,47 @@
+{
+  "job_id": "6899085a-6c7b-44cd-92f6-ce0871011e55",
+  "conversation_id": "c169f08eb99345ef9e7aa812c2175eba",
+  "timestamp": 1794386240.0421093,
+  "goal": "process",
+  "expanded_tasks": [
+    {
+      "task_id": 1,
+      "task_description": "Convert the attached markdown document into a structured JSON object for processing.",
+      "agent_id": "byoa-md-json",
+      "inputs": {
+        "md": "$task_9001.text"
+      },
+      "depends_on": []
+    },
+    {
+      "task_id": 2,
+      "task_description": "Fetch the ground-truth JSON for the document identified in the extracted structure.",
+      "agent_id": "byoa-groundtruth",
+      "inputs": {
+        "actual": "$task_1.structured"
+      },
+      "depends_on": [
+        1
+      ]
+    },
+    {
+      "task_id": 3,
+      "task_description": "Compare the extracted JSON against the ground-truth JSON to validate the extraction.",
+      "agent_id": "byoa-val-json",
+      "inputs": {
+        "actual": "$task_1.structured",
+        "ground_truth": "$task_2.ground_truth"
+      },
+      "depends_on": [
+        1,
+        2
+      ]
+    }
+  ],
+  "planned_by": "agent_list",
+  "agent_route": [
+    "byoa-md-json",
+    "byoa-groundtruth",
+    "byoa-val-json"
+  ]
+}

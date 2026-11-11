@@ -1,0 +1,98 @@
+{
+    "document_title": "Tax Invoice",
+    "invoice_number": "9930324343",
+    "invoice_dt": "2026-10-15",
+    "page": "1/1",
+    "supplier": {
+        "name": "Ingram Micro Asia Pte Ltd",
+        "address": "205 Kallang Bahru #04-00",
+        "postal_city": "Singapore 339341",
+        "tel": "+65 6298 0888",
+        "website": "www.ingrammicro.com.sg",
+        "company_reg": "198302829C",
+        "gst_reg": "M2-0061140-3",
+        "trader_id": "12829830000E E&OE"
+    },
+    "customer": {
+        "customer_id": "101906",
+        "name": "Gain City Best-Electric Pte Ltd",
+        "po_number": "PO-TB10110980-SL",
+        "credit_representative": "Elaine Ooi",
+        "sales_rep": "Leona Wong"
+    },
+    "billing": {
+        "bill_to": "Gain City Best-Electric Pte Ltd",
+        "bill_address": "No 8 Ang Mo Kio Industrial Pk2",
+        "bill_city_zip": "569500 Singapore SG SG"
+    },
+    "sold_to": {
+        "company": "GAIN CITY BEST-ELECTRIC PTE LTD",
+        "street": "NO 8 ANG MO KIO INDUSTRIAL PK2",
+        "city_zip": "569500 SINGAPORE SG SG",
+        "gst_no": "M201164397"
+    },
+    "shipping": {
+        "ship_to": "Gain City Best-Electric Pte Ltd",
+        "addr_1": "Showroom - Sim Lim Square",
+        "addr_2": "1 Rochor Canal Road #04-64",
+        "city_zip": "188504 Singapore SG SG",
+        "delivery_number": "8110584232",
+        "incoterms": "DDU (Delivered Duty Unpaid)"
+    },
+    "references": {
+        "sales_order": "7111440414",
+        "doc_no": "9930324343"
+    },
+    "currency_code": "SGD",
+    "fx_rate": 1.0,
+    "payment_terms": "Net 30 days",
+    "payment_instructions": "Remit payment in SGD",
+    "supply_type": "Computer Products & Related Services",
+    "items": [
+        {
+            "line_no": "80",
+            "product": "Lenovo Digital Pen 2",
+            "barcode": "195892053262",
+            "sku": "6290023",
+            "mfr_part": "GX81J19850",
+            "quantity": 20,
+            "uom": "EA",
+            "price_per_unit": "SGD 14.00",
+            "line_amount": "SGD 280.00",
+            "outstanding_qty": 0
+        },
+        {
+            "line_no": "60",
+            "product": "Lenovo 65W USB-C Wall Adapter-UK Pin",
+            "barcode": "195892083917",
+            "sku": "6276587",
+            "mfr_part": "GX21L58557",
+            "quantity": 10,
+            "uom": "EA",
+            "price_per_unit": "SGD 21.00",
+            "line_amount": "SGD 210.00",
+            "outstanding_qty": 0
+        },
+        {
+            "line_no": "70",
+            "product": "Lenovo Yoga Pen",
+            "barcode": "195892122012",
+            "sku": "6886172",
+            "mfr_part": "GX81S07448",
+            "quantity": 25,
+            "uom": "EA",
+            "price_per_unit": "SGD 31.00",
+            "line_amount": "SGD 775.00",
+            "outstanding_qty": 0
+        }
+    ],
+    "totals": {
+        "freight": 0.0,
+        "transaction_fee": 0.0,
+        "net_total": "SGD 1,110.00",
+        "gst_rate": "9%",
+        "gst": "SGD 99.90",
+        "amount_due": "SGD 1,209.90",
+        "gross_weight": "19.8 kg"
+    }
+}

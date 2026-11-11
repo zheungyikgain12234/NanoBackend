@@ -29,6 +29,7 @@ provably never applied. focus_instruction and check_instruction (the
 gap-fill honesty mechanism) are untouched and always included when a focus
 is present, since those aren't overhead -- they're the actual behavior.
 """
+import difflib
 import hashlib
 import json
 import os
@@ -3181,6 +3182,866 @@ def _repair_hallucinated_short_code_field(row_dict, row_text):
     return row_dict
 
 
+# ---------------------------------------------------------------------------
+# Source-cell coverage check for markdown table rows.
+#
+# Why this exists: the per-row model call is only ASKED to put every
+# column in the output; nothing used to CHECK that it did. Production
+# showed the model returning null for a column (e.g. "RT NO.") even
+# though the code was printed in the row's own text, and the value then
+# vanished from the final JSON. For markdown tables the source row is
+# already split into cells by the "|" characters, so this check is plain
+# string work with no model call: any cell whose content is not found
+# anywhere in the extracted result is put back under its own header name.
+# ---------------------------------------------------------------------------
+_MD_SEPARATOR_ROW_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$"
+)
+_ANNOTATION_ONLY_RE = re.compile(r"^\s*\[[^\]]{1,40}\]\s*$")
+_NUMERIC_CELL_RE = re.compile(
+    r"^\s*(?:[A-Za-z]{0,3}\$|[$\u20ac\u00a3\u00a5])?\s*(-?[\d,]*\.?\d+)\s*$"
+)
+
+
+def _split_md_row_cells(line: str):
+    """Returns the cell texts of a markdown table line, or None if `line` is not one."""
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+    s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _is_md_separator_line(line: str) -> bool:
+    return "-" in line and bool(_MD_SEPARATOR_ROW_RE.match(line))
+
+
+def _md_table_headers_in(context: str) -> list:
+    """
+    Every markdown header row found in `context` (a header row is a pipe
+    line directly followed by a "| --- | --- |" separator line), as a list
+    of cell-text lists, in document order.
+    """
+    lines = context.split("\n")
+    headers = []
+    for i in range(len(lines) - 1):
+        cells = _split_md_row_cells(lines[i])
+        if cells is None or _is_md_separator_line(lines[i]):
+            continue
+        if _is_md_separator_line(lines[i + 1]):
+            headers.append(cells)
+    return headers
+
+
+def _header_to_field_name(header: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", header.lower()).strip("_")
+
+
+def _number_in_text(text: str):
+    m = _NUMERIC_CELL_RE.match(text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _collect_leaf_values(node, out: list, skip_keys: tuple = ()):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if k in skip_keys:
+                continue
+            _collect_leaf_values(v, out, skip_keys)
+    elif isinstance(node, list):
+        for v in node:
+            _collect_leaf_values(v, out, skip_keys)
+    elif isinstance(node, bool) or node is None:
+        return
+    elif isinstance(node, (int, float, str)):
+        out.append(node)
+
+
+def _word_key(word: str) -> str:
+    """Lower-cased word with all punctuation removed (letters of any script and digits kept)."""
+    return re.sub(r"[\W_]+", "", word.lower())
+
+
+def _cell_is_covered(cell: str, values: list) -> bool:
+    """
+    True if every word of `cell` can be found in `values` (the extracted
+    result's leaf values). Numbers are compared by numeric value, so
+    "S$1,200.00" matches 1200.0. Punctuation is ignored, and a word made
+    only of punctuation (":" or "|") is skipped. Words of 3 characters or
+    fewer must match a whole word (so "5" is not "found" inside "500").
+    Longer words may match as a substring or as a close spelling (>= 0.85
+    similar), so a legitimate one-letter OCR fix by the model is not
+    reported as missing.
+    """
+    blob = " ".join(str(v).lower() for v in values)
+    blob_keys_text = " ".join(k for k in (_word_key(w) for w in blob.split()) if k)
+    blob_words = set(blob.split())
+    blob_words.update(blob_keys_text.split())
+    numbers = set()
+    for v in values:
+        if isinstance(v, (int, float)):
+            numbers.add(float(v))
+        else:
+            n = _number_in_text(str(v))
+            if n is not None:
+                numbers.add(n)
+    for word in cell.split():
+        key = _word_key(word)
+        if not key:
+            continue
+        n = _number_in_text(word)
+        if n is not None and any(abs(n - x) < 1e-9 for x in numbers):
+            continue
+        if len(key) <= 3:
+            if word.lower() in blob_words or key in blob_words:
+                continue
+            return False
+        if word.lower() in blob or key in blob_keys_text:
+            continue
+        if difflib.get_close_matches(key, blob_words, n=1, cutoff=0.85):
+            continue
+        return False
+    return True
+
+
+_NUMBER_THEN_UNIT_RE = re.compile(r"^\s*(-?[\d,]*\.?\d+)\s*([A-Za-z]{1,8})\s*$")
+_UNIT_THEN_NUMBER_RE = re.compile(r"^\s*([A-Za-z]{1,8})\s*(-?[\d,]*\.?\d+)\s*$")
+
+
+def _record_cell_unit(row_dict: dict, header_name: str, cell: str) -> bool:
+    """
+    A cell such as "10 EA" or "21.00 SGD" (a number with a unit/currency
+    word) whose column already has the NUMBER in the model's result but
+    not the unit word: the unit is stored as "<column>_unit" ("inv_qty_unit":
+    "EA") instead of the whole cell being repeated under "<column>_from_source".
+    Returns True when the cell was dealt with here (unit recorded, or the
+    column already has its own "<column>_unit"), False when the normal
+    check should handle the cell (no match, column missing or null, or the
+    number differs from what the model wrote).
+    """
+    m = _NUMBER_THEN_UNIT_RE.match(cell)
+    if m:
+        number_text, unit = m.group(1), m.group(2)
+    else:
+        m = _UNIT_THEN_NUMBER_RE.match(cell)
+        if not m:
+            return False
+        unit, number_text = m.group(1), m.group(2)
+    try:
+        number = float(number_text.replace(",", ""))
+    except ValueError:
+        return False
+    norm = re.sub(r"[^a-z0-9]", "", header_name)
+    key = next(
+        (k for k in row_dict if re.sub(r"[^a-z0-9]", "", str(k).lower()) == norm),
+        None,
+    )
+    if key is None or row_dict[key] is None:
+        return False
+    existing = row_dict[key]
+    existing_number = float(existing) if isinstance(existing, (int, float)) and not isinstance(existing, bool) \
+        else _number_in_text(str(existing))
+    if existing_number is None or abs(existing_number - number) > 1e-9:
+        return False
+    # A currency code is a currency, not a unit of measure: it goes to
+    # "<column>_currency" (the same name the row prompt asks the model to
+    # use), and nothing is added when the model already gave the column its
+    # currency or its unit -- otherwise the same "SGD" came out twice, as
+    # "amount_unit" and "amount_currency".
+    if row_dict.get(f"{key}_currency") is not None or row_dict.get(f"{key}_unit") is not None:
+        return True
+    suffix = "_currency" if unit.upper() in _CURRENCY_CODES else "_unit"
+    row_dict[f"{key}{suffix}"] = unit
+    return True
+
+
+def _backfill_uncaptured_row_cells(row_dict, row_text, header_context):
+    """
+    Guarantees that no text printed in ONE source row silently disappears
+    from that row's extracted result. Works for every row format:
+
+    - Markdown row ("| AC6215 | 2in pipe | 500 PCS |"): each cell is checked.
+      If a header row with the SAME number of columns exists in
+      `header_context` (the last such header wins -- the table being read
+      is the one right above its rows), a missing cell is stored under its
+      header name ("RT NO." -> "rt_no"). A key the model made but left
+      null is filled in; a key that already holds a different value is
+      left alone and the source cell is kept as "<name>_from_source".
+    - Any other cell/segment that cannot be given a certain field name --
+      markdown with no matching header, a blank header, or a plain OCR
+      row (cut into pieces at its big whitespace gaps) -- is kept as plain
+      text in a list under "uncaptured_row_text" instead of being guessed
+      into a field name.
+
+    "Missing" means: not found anywhere in the row's result (see
+    _cell_is_covered), so a correct extraction is never changed, and
+    running this twice gives the same result. Bracketed OCR annotations
+    like "[handwriting 3]" are ignored.
+    """
+    if not isinstance(row_dict, dict) or not isinstance(row_text, str):
+        return row_dict
+    headers = _md_table_headers_in(header_context) if isinstance(header_context, str) else []
+    values = []
+    _collect_leaf_values(row_dict, values, skip_keys=("uncaptured_row_text",))
+    leftovers = []
+
+    for line in row_text.split("\n"):
+        if not line.strip():
+            continue
+        md_cells = _split_md_row_cells(line)
+        if md_cells is not None:
+            if _is_md_separator_line(line):
+                continue
+            matching = [h for h in headers if len(h) == len(md_cells)]
+            header = matching[-1] if matching else None
+            for idx, cell in enumerate(md_cells):
+                if not cell or _ANNOTATION_ONLY_RE.match(cell):
+                    continue
+                # "10 EA" / "21.00 SGD": keep the unit per column, even when
+                # the same unit word appears under another column.
+                if header and _header_to_field_name(header[idx]) and _record_cell_unit(
+                    row_dict, _header_to_field_name(header[idx]), cell
+                ):
+                    values.append(cell)
+                    continue
+                # An identifier printed as digits with a leading zero or 9+
+                # digits must stay text exactly as printed (a number loses the
+                # zero / precision). Only replaces the model's number when it
+                # equals the printed value.
+                if header and re.fullmatch(r"\d+", cell) and (
+                    (cell.startswith("0") and len(cell) > 1) or len(cell) >= 9
+                ):
+                    id_norm = re.sub(r"[^a-z0-9]", "", _header_to_field_name(header[idx]))
+                    id_key = next(
+                        (k for k in row_dict if id_norm and re.sub(r"[^a-z0-9]", "", str(k).lower()) == id_norm),
+                        None,
+                    )
+                    if (
+                        id_key is not None
+                        and isinstance(row_dict[id_key], (int, float))
+                        and not isinstance(row_dict[id_key], bool)
+                        and float(row_dict[id_key]) == float(int(cell))
+                    ):
+                        row_dict[id_key] = cell
+                        values.append(cell)
+                        continue
+                if _cell_is_covered(cell, values):
+                    continue
+                name = _header_to_field_name(header[idx]) if header else ""
+                if not name:
+                    leftovers.append(cell)
+                else:
+                    norm = re.sub(r"[^a-z0-9]", "", name)
+                    existing = next(
+                        (k for k in row_dict if re.sub(r"[^a-z0-9]", "", str(k).lower()) == norm),
+                        None,
+                    )
+                    if existing is None:
+                        row_dict[name] = cell
+                    elif row_dict[existing] is None:
+                        row_dict[existing] = cell
+                    else:
+                        row_dict[name + "_from_source"] = cell
+                values.append(cell)
+        else:
+            for seg in _split_line_into_gap_segments(line):
+                if len(seg) < 2 or _ANNOTATION_ONLY_RE.match(seg) or _cell_is_covered(seg, values):
+                    continue
+                leftovers.append(seg)
+                values.append(seg)
+
+    if leftovers:
+        existing_list = row_dict.get("uncaptured_row_text")
+        merged = list(existing_list) if isinstance(existing_list, list) else []
+        merged += [x for x in leftovers if x not in merged]
+        row_dict["uncaptured_row_text"] = merged
+    return row_dict
+
+
+
+def _capture_uncaptured_table_lines(doc_parsed, region_text, row_texts):
+    """
+    Markdown table lines that sit inside the table area but were NOT
+    treated as item rows (for example a group heading line such as
+    "| | AC DUCT TRUNKING SUPERJET STICKER | | | |") are in neither the
+    per-row calls nor the document-level call, so their text never
+    reached the output. Any such line with a cell that is not found
+    anywhere in `doc_parsed` is kept, as plain text (its non-empty cells
+    joined by a space), in a list under "uncaptured_table_text".
+    Header rows, separator rows, and the real item rows are skipped.
+    Does nothing when there is nothing to add.
+    """
+    if not isinstance(doc_parsed, dict) or not isinstance(region_text, str):
+        return doc_parsed
+    row_set = {r.strip() for r in row_texts if isinstance(r, str)}
+    lines = region_text.split("\n")
+    values = []
+    _collect_leaf_values(doc_parsed, values, skip_keys=("uncaptured_table_text",))
+    found = []
+    for i, line in enumerate(lines):
+        cells = _split_md_row_cells(line)
+        if cells is None or _is_md_separator_line(line) or line.strip() in row_set:
+            continue
+        if i + 1 < len(lines) and _is_md_separator_line(lines[i + 1]):
+            continue  # this is a header row
+        non_empty = [c for c in cells if c]
+        if not non_empty:
+            continue
+        if all(_cell_is_covered(c, values) for c in non_empty):
+            continue
+        text = " ".join(non_empty)
+        if text not in found:
+            found.append(text)
+    if found:
+        existing = doc_parsed.get("uncaptured_table_text")
+        if isinstance(existing, list):
+            found = existing + [f for f in found if f not in existing]
+        doc_parsed["uncaptured_table_text"] = found
+    return doc_parsed
+
+
+def _backfill_markdown_fields_outside_items(doc_parsed, source_text, skip_start, skip_end):
+    """
+    Guarantees that no markdown table text OUTSIDE the item rows (a totals
+    box, an account/terms strip, a tax summary, a second small table...)
+    silently disappears from the result. Plain text work, no model call,
+    so the answer is the same on every run -- the model steps that used to
+    be the only source for these values answered differently run to run.
+    Rows inside [skip_start, skip_end), the item-row area, are not touched.
+
+    Rule: never lose a VALUE, and only invent a field NAME when the
+    table's structure makes the name certain.
+      Named field (certain) -- two shapes only:
+        - "titles": a header row of 3+ columns with no digit in it (so it
+          is column titles, not data) and exactly ONE data row of the same
+          width: each title names the cell under it;
+        - "box": a 2-column header row whose second cell has a digit (so
+          that row is itself data, e.g. "SUB TOTAL | 4,335.36"): every
+          2-cell row is label -> value.
+        A label becomes a field name ("ADD GST @ 9%" -> "add_gst_9"). A
+        key that exists with null is filled; a key holding a different
+        value is left alone and the source value goes to "<name>_from_source".
+      Anything else whose VALUE is not found in the result is kept as
+      plain text in doc_parsed["uncaptured_table_text"]:
+        - titled table, several rows: "Title: value" per missing cell;
+        - 2-column row: "label: value" when the value is missing;
+        - any other row: the whole row joined with " | " when one of its
+          digit-containing cells is missing.
+      Labels are never judged as "missing" (a label such as "Subtotal" is
+      a key, not a value, so it never appears among the result's values).
+    "Found" means present anywhere in `doc_parsed` (see _cell_is_covered),
+    so a correct extraction is never changed and a second run adds nothing.
+    """
+    if not isinstance(doc_parsed, dict) or not isinstance(source_text, str):
+        return doc_parsed
+
+    tables = []
+    current = []
+    pos = 0
+    for line in source_text.split("\n"):
+        start = pos
+        pos += len(line) + 1
+        in_skip = skip_start <= start < skip_end
+        if not in_skip and _split_md_row_cells(line) is not None:
+            current.append(line)
+        else:
+            if current:
+                tables.append(current)
+                current = []
+    if current:
+        tables.append(current)
+
+    values = []
+    _collect_leaf_values(doc_parsed, values, skip_keys=("uncaptured_table_text",))
+    leftovers = []
+
+    def _usable(cell):
+        return bool(cell) and not _ANNOTATION_ONLY_RE.match(cell)
+
+    def _has_digit(cell):
+        return any(ch.isdigit() for ch in cell)
+
+    def _set_named(label, value):
+        name = _header_to_field_name(label)
+        if not name:
+            return False
+        norm = re.sub(r"[^a-z0-9]", "", name)
+        existing = next(
+            (k for k in doc_parsed if re.sub(r"[^a-z0-9]", "", str(k).lower()) == norm),
+            None,
+        )
+        if existing is None:
+            doc_parsed[name] = value
+        elif doc_parsed[existing] is None:
+            doc_parsed[existing] = value
+        else:
+            doc_parsed[name + "_from_source"] = value
+        return True
+
+    def _keep(text):
+        if text not in leftovers:
+            leftovers.append(text)
+
+    for table in tables:
+        has_header = len(table) >= 2 and _is_md_separator_line(table[1])
+        if has_header:
+            header = _split_md_row_cells(table[0])
+            body = [_split_md_row_cells(l) for l in table[2:] if not _is_md_separator_line(l)]
+        else:
+            header = None
+            body = [_split_md_row_cells(l) for l in table if not _is_md_separator_line(l)]
+
+        titles = (
+            header is not None and len(header) >= 3
+            and not any(_has_digit(c) for c in header)
+        )
+        box = (
+            header is not None and len(header) == 2 and bool(header[0])
+            and _has_digit(header[1])
+        )
+
+        # 1) Named fields -- only for the two certain shapes.
+        handled_rows = set()  # ids of rows fully dealt with above
+        if titles and len(body) == 1 and len(body[0]) == len(header):
+            for label, value in zip(header, body[0]):
+                if _usable(label) and _usable(value) and not _cell_is_covered(value, values):
+                    if _set_named(label, value):
+                        values.append(value)
+            handled_rows.add(id(body[0]))
+        if box:
+            pairs = [header] + [r for r in body if len(r) == 2]
+            for r in pairs:
+                label, value = r
+                if _usable(label) and _usable(value) and not _cell_is_covered(value, values):
+                    if _set_named(label, value):
+                        values.append(value)
+                handled_rows.add(id(r))
+
+        # 2) Keep any value still missing, as text.
+        rows = []
+        if header is not None and not titles and not box:
+            rows.append(header)
+        rows += [r for r in body if id(r) not in handled_rows]
+
+        for cells in rows:
+            usable = [c for c in cells if _usable(c)]
+            if not usable:
+                continue
+            if titles and len(cells) == len(header):
+                for idx, cell in enumerate(cells):
+                    if _usable(cell) and not _cell_is_covered(cell, values):
+                        label = header[idx] if _usable(header[idx]) else ""
+                        _keep(f"{label}: {cell}" if label else cell)
+                        values.append(cell)
+            elif len(cells) == 2:
+                if _usable(cells[1]) and not _cell_is_covered(cells[1], values):
+                    _keep(": ".join(usable))
+                    values.append(cells[1])
+            else:
+                # A first cell made of several words with letters is the
+                # row's LABEL ("GST @ 9.00%", "Tax (7%)"): labels are keys,
+                # not values, so only the cells after it are checked. A
+                # single-token first cell is a code or row number ("T0032169",
+                # "60") and is checked like any other cell.
+                judged = (
+                    usable[1:]
+                    if len(usable) > 1 and len(usable[0].split()) >= 2 and re.search(r"[^\W\d_]", usable[0])
+                    else usable
+                )
+                if any(_has_digit(c) and not _cell_is_covered(c, values) for c in judged):
+                    _keep(" | ".join(usable))
+                    values.extend(usable)
+
+    if leftovers:
+        existing_list = doc_parsed.get("uncaptured_table_text")
+        merged = list(existing_list) if isinstance(existing_list, list) else []
+        merged += [x for x in leftovers if x not in merged]
+        doc_parsed["uncaptured_table_text"] = merged
+    return doc_parsed
+
+
+
+# ---------------------------------------------------------------------------
+# Model-driven completeness pass.
+#
+# The model must be the one that decides to include everything. The first
+# document-level call is told to, but a model that is asked for a summary of
+# a document can still skip lines (phone/fax numbers, website, certification
+# marks, payment instructions...). So after it answers, the code only does
+# the DETECTION: it finds source lines whose words do not appear anywhere in
+# the result, and shows them to the model together with what was captured so
+# far. The MODEL then decides what each line is, splits lines that hold
+# several facts, and chooses the field names. Code only checks that the
+# model did not invent words (every word it returns must exist in the source)
+# and never overwrites an existing value. Works on any format (markdown,
+# OCR text, plain text) because nothing here depends on table shape.
+# ---------------------------------------------------------------------------
+_COMPLETENESS_MAX_CHUNK_CHARS = 5000
+_COMPLETENESS_MAX_CHUNKS = 6
+_COMPLETENESS_MAX_ROUNDS = 3
+
+
+def _find_uncaptured_source_lines(doc_parsed: dict, source_text: str) -> list:
+    """Source lines (markdown rows shown as "a | b | c") with a word not found in doc_parsed."""
+    values = []
+    _collect_leaf_values(doc_parsed, values)
+    out = []
+    seen = set()
+    for raw in source_text.split("\n"):
+        line = raw.replace(_OCR_WS_PLACEHOLDER, " ")
+        if not line.strip() or _is_md_separator_line(line):
+            continue
+        cells = _split_md_row_cells(line)
+        text = " | ".join(c for c in cells if c) if cells is not None else line
+        text = re.sub(r"\s+", " ", text).strip()
+        if not _word_key(text) or _ANNOTATION_ONLY_RE.match(text) or text in seen:
+            continue
+        if not _cell_is_covered(text, values):
+            seen.add(text)
+            out.append(text)
+    return out
+
+
+def _model_complete_missing_source_text(doc_parsed, source_text, timeout_secs: float = 20):
+    if not isinstance(doc_parsed, dict) or not isinstance(source_text, str):
+        return doc_parsed
+    source_keys = {k for k in (_word_key(w) for w in source_text.split()) if k}
+
+    def _ask(chunk, shown_json):
+        prompt = (
+            "Below is JSON that was extracted from a business document, "
+            "followed by lines printed on the SAME document that do not "
+            "appear to be in that JSON yet. The goal is that NOTHING printed "
+            "on the document is lost. Add every line that carries "
+            "information as new fields: contact numbers (phone, fax, email, "
+            "website), addresses, certification or registration marks, "
+            "reference numbers, dates, notes, payment or bank instructions, "
+            "and caption lines such as signature or stamp lines -- anything "
+            "printed. Rules:\n"
+            "- Name each field in lower_snake_case after what the text is "
+            "(use the label printed in the line when there is one, otherwise "
+            "its role, e.g. vendor_phone). Use a key that is not already in "
+            "the JSON.\n"
+            "- Copy values exactly as printed. Do not paraphrase, translate, "
+            "reformat or correct them, and never add words that are not in "
+            "the line.\n"
+            "- A line that holds several facts (e.g. \"TEL : x FAX : y\") "
+            "becomes several fields.\n"
+            "- When one label has several values on the same row or line (for "
+            "example two amount columns next to \"Subtotal\"), keep the first "
+            "value under the label and name the others <label>_2, <label>_3 "
+            "in the order printed -- never an invented suffix such as "
+            "\"_total\", which suggests a different meaning.\n"
+
+            "- Skip a line ONLY if it is just a heading or label for "
+            "information the JSON already holds, or pure decoration.\n"
+            "- Output ONLY one JSON object of the new fields, no explanation "
+            "and no markdown fences. Output {} if there is nothing to add.\n\n"
+            "JSON SO FAR:\n" + shown_json + "\n\nLINES NOT YET CAPTURED:\n"
+            + "\n".join(chunk)
+        )
+        try:
+            raw = _call_ollama(prompt, max(timeout_secs * 0.25, 10))
+            parsed, _ = _try_parse_json(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _apply(additions) -> int:
+        values = []
+        _collect_leaf_values(doc_parsed, values)
+        added = 0
+        for key, val in additions.items():
+            name = _header_to_field_name(str(key))
+            if not name or name == "line_items":
+                continue
+            if isinstance(val, (list, tuple)) and val and all(
+                isinstance(x, (str, int, float)) and not isinstance(x, bool) for x in val
+            ):
+                val = ", ".join(str(x) for x in val)
+            if val is None or isinstance(val, (bool, dict, list, tuple)):
+                continue
+            text = str(val).strip()
+            if not text:
+                continue
+            # Grounding: every word the model returned must exist in the source.
+            if any(_word_key(t) and _word_key(t) not in source_keys for t in text.split()):
+                continue
+            if _cell_is_covered(text, values):
+                continue
+            if name in doc_parsed and doc_parsed[name] is None:
+                doc_parsed[name] = val
+            else:
+                unique, n = name, 2
+                while unique in doc_parsed:
+                    unique = f"{name}_{n}"
+                    n += 1
+                doc_parsed[unique] = val
+            values.append(text)
+            added += 1
+        return added
+
+    # A line the model has already been shown is never shown again: if it
+    # chose not to add it (a label, decoration), that is its decision. More
+    # than one round only happens when a very long document has more
+    # missing lines than fit in one round's chunks.
+    already_shown = set()
+    for _ in range(_COMPLETENESS_MAX_ROUNDS):
+        missing = [
+            l for l in _find_uncaptured_source_lines(doc_parsed, source_text)
+            if l not in already_shown
+        ]
+        if not missing:
+            break
+        chunks, cur, size = [], [], 0
+        for line in missing:
+            if cur and size + len(line) > _COMPLETENESS_MAX_CHUNK_CHARS:
+                chunks.append(cur)
+                cur, size = [], 0
+            cur.append(line)
+            size += len(line) + 1
+        if cur:
+            chunks.append(cur)
+        chunks = chunks[:_COMPLETENESS_MAX_CHUNKS]
+        for chunk in chunks:
+            already_shown.update(chunk)
+        shown_json = json.dumps(
+            {k: v for k, v in doc_parsed.items() if k != "line_items"}, ensure_ascii=False
+        )[:8000]
+
+        pool_size = min(len(chunks), MAX_CONCURRENT_MODEL_CALLS)
+        with ThreadPoolExecutor(max_workers=max(pool_size, 1)) as executor:
+            futures = [executor.submit(_ask, chunk, shown_json) for chunk in chunks]
+            results = [f.result() for f in futures]
+        for r in results:
+            _apply(r)
+    return doc_parsed
+
+
+def _checklist_from_md_header(header_context, row_texts) -> str:
+    """
+    For markdown item tables: the "column headers" list given to every row
+    call, taken straight from the item table's OWN header row -- the last
+    markdown header above the rows whose column count equals the rows'
+    column count. Returns "" when that cannot be determined (not markdown,
+    rows of different widths, no matching header), and the caller then uses
+    the model-based header list as before.
+
+    Why: the model-based list reads the WHOLE document, so on a document
+    with several tables every row was told to include a field for the
+    headers of the OTHER tables too (a totals box's "Freight Charge",
+    another table's "Item No.", "LCN"...), which then came back as empty
+    fields on every item. It also needed one extra model call and could
+    answer differently from run to run; reading the header row needs
+    neither.
+    """
+    if not isinstance(header_context, str) or not row_texts:
+        return ""
+    widths = set()
+    for rt in row_texts:
+        lines = [l for l in str(rt).split("\n") if l.strip()]
+        if len(lines) != 1 or _is_md_separator_line(lines[0]):
+            return ""
+        cells = _split_md_row_cells(lines[0])
+        if cells is None:
+            return ""
+        widths.add(len(cells))
+    if len(widths) != 1:
+        return ""
+    width = widths.pop()
+    matching = [h for h in _md_table_headers_in(header_context) if len(h) == width]
+    if not matching:
+        return ""
+    titles = [h for h in matching[-1] if h]
+    if not titles:
+        return ""
+    return (
+        "The following column headers are the item table's own header "
+        "row, in order. Include a field for EVERY header listed here -- "
+        "using null for a row whose cell under that header is genuinely "
+        "blank -- even for headers that look minor, short, or redundant "
+        "with a neighboring one. Never combine two of these listed "
+        "headers into one field:\n"
+        + ", ".join(titles) + "\n\n"
+    )
+
+
+_MONEY_CELL_RE = re.compile(
+    r"^\s*(?P<pre>(?:[A-Za-z]{1,3}\$|[$\u20ac\u00a3\u00a5]|[A-Za-z]{2,3})\s*)?"
+    r"(?P<num>-?\d[\d,]*(?:\.\d+)?|-?\.\d+)"
+    r"\s*(?P<post>[A-Za-z]{2,3})?\s*$"
+)
+# Only these count as a currency. A bare 3-letter word is NOT enough: "500
+# PCS", "12 BOX", "3 SET", "19.8 KGS" are quantities with a unit, not money.
+_CURRENCY_CODES = {
+    "SGD", "USD", "EUR", "GBP", "JPY", "CNY", "RMB", "MYR", "IDR", "THB",
+    "AUD", "HKD", "INR", "KRW", "NZD", "CAD", "CHF", "TWD", "PHP", "VND",
+    "AED", "SAR", "BND", "ZAR", "SEK", "NOK", "DKK", "RM",
+}
+_CURRENCY_SYMBOLS = {"S$", "US$", "A$", "HK$", "NZ$", "C$", "$", "\u20ac", "\u00a3", "\u00a5"}
+_ID_KEY_WORDS = {
+    "no", "number", "code", "sku", "ean", "upc", "gtin", "part", "id",
+    "ref", "item", "serial", "barcode", "model",
+}
+
+
+def _money_parts(value):
+    """(number, currency_token or "") for a string like "S$970.00" / "21.00 SGD" / "1,200.00"; else None."""
+    if not isinstance(value, str):
+        return None
+    m = _MONEY_CELL_RE.match(value)
+    if not m:
+        return None
+    try:
+        number = float(m.group("num").replace(",", ""))
+    except ValueError:
+        return None
+    token = (m.group("pre") or m.group("post") or "").strip()
+    if token and token.upper() not in _CURRENCY_CODES and token.upper() not in _CURRENCY_SYMBOLS:
+        return None  # a unit word such as PCS / BOX / KG, not a currency
+    return number, token
+
+
+def _normalize_line_item_column_types(parsed):
+    """
+    Makes each line_items column ONE type across rows. The model chooses a
+    type per row, so the same column came back as "S$970.00" (text) on one
+    row and 806.96 (number) on the next, and an EAN/SKU as a number on one
+    row and text on the next. Anything that sums, compares or matches
+    values across rows or documents (e.g. the match agent) breaks on that.
+    Only columns that are MIXED are touched; a column that is already one
+    type is left exactly as the model wrote it.
+
+    - Amounts: a column mixing numbers with money text ("S$970.00",
+      "21.00 SGD", "1,200.00") becomes numbers. The currency symbol/code is
+      not thrown away: it goes to "<column>_currency" (on every row of the
+      column when all rows share one currency token, otherwise only on the
+      rows that printed one).
+    - Identifiers: a column mixing numbers with digit-only text ("6276587"
+      vs "6886172") becomes text when its name is identifier-like (no,
+      code, sku, ean, upc, part, item, ref, id, model...) or any value has a
+      leading zero or 9+ digits (a number would lose the zero or precision).
+      Otherwise it becomes numbers.
+    - Any other mix (words, dates...) is left alone.
+    """
+    def _walk(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key == "line_items" and isinstance(value, list):
+                    _fix_items([it for it in value if isinstance(it, dict)])
+                else:
+                    _walk(value)
+        elif isinstance(node, list):
+            for it in node:
+                _walk(it)
+
+    def _fix_items(items):
+        if len(items) < 2:
+            return
+        keys = []
+        for it in items:
+            for k in it:
+                if k not in keys:
+                    keys.append(k)
+        for key in keys:
+            present = [it for it in items if it.get(key) is not None]
+            if len(present) < 2:
+                continue
+            kinds = []
+            for it in present:
+                v = it[key]
+                if isinstance(v, bool):
+                    kinds.append("other")
+                elif isinstance(v, (int, float)):
+                    kinds.append("num")
+                elif isinstance(v, str) and v.strip().isdigit():
+                    kinds.append("digits")
+                elif _money_parts(v) is not None:
+                    kinds.append("money")
+                else:
+                    kinds.append("other")
+            if "other" in kinds or len(set(kinds)) < 2:
+                continue
+            kindset = set(kinds)
+            if "money" in kindset and "digits" not in kindset:
+                tokens = [(_money_parts(it[key]) or (None, ""))[1] for it, k in zip(present, kinds) if k == "money"]
+                tokens = [t for t in tokens if t]
+                shared = tokens[0] if tokens and len(set(tokens)) == 1 else None
+                for it, k in zip(present, kinds):
+                    if k == "money":
+                        number, token = _money_parts(it[key])
+                        it[key] = number
+                        if token and not shared and f"{key}_currency" not in it:
+                            it[f"{key}_currency"] = token
+                if shared:
+                    for it in present:
+                        it.setdefault(f"{key}_currency", shared)
+            elif kindset == {"num", "digits"}:
+                nums_ok = all(
+                    isinstance(it[key], int) or (isinstance(it[key], float) and it[key].is_integer())
+                    for it, k in zip(present, kinds) if k == "num"
+                )
+                if not nums_ok:
+                    continue
+                texts = [it[key].strip() for it, k in zip(present, kinds) if k == "digits"]
+                hinted = bool(set(re.split(r"[^a-z0-9]+", str(key).lower())) & _ID_KEY_WORDS)
+                risky = any((t.startswith("0") and len(t) > 1) or len(t) >= 9 for t in texts)
+                for it, k in zip(present, kinds):
+                    if hinted or risky:
+                        if k == "num":
+                            it[key] = str(int(it[key]))
+                    elif k == "digits":
+                        it[key] = int(it[key].strip())
+
+    _walk(parsed)
+    return parsed
+
+
+def _group_headings_for_rows(region_text, row_texts) -> list:
+    """
+    A markdown item table can contain a GROUP HEADING line: a row with just
+    one non-empty cell ("| | AC DUCT TRUNKING SUPERJET STICKER | | | |") that
+    names what the item rows below it are. Returns one entry per item row
+    (the nearest heading above it, or None), in row order -- or [] when it
+    cannot be done safely (rows that are not single markdown lines, or a row
+    that cannot be found in the region). Header rows, separator rows and
+    item rows are never headings. A heading with no item row after it is not
+    attached to anything here (the table-line safety net keeps its text).
+    """
+    if not isinstance(region_text, str) or not row_texts:
+        return []
+    wanted = []
+    for rt in row_texts:
+        lines = [l for l in str(rt).split("\n") if l.strip()]
+        if len(lines) != 1 or _split_md_row_cells(lines[0]) is None:
+            return []
+        wanted.append(lines[0].strip())
+    lines = region_text.split("\n")
+    out = []
+    heading = None
+    for i, line in enumerate(lines):
+        cells = _split_md_row_cells(line)
+        if cells is None or _is_md_separator_line(line):
+            continue
+        if i + 1 < len(lines) and _is_md_separator_line(lines[i + 1]):
+            heading = None  # a new table's header row starts here
+            continue
+        if len(out) < len(wanted) and line.strip() == wanted[len(out)]:
+            out.append(heading)
+            continue
+        non_empty = [c for c in cells if c]
+        if len(non_empty) == 1 and re.search(r"[^\W\d_]", non_empty[0]):
+            heading = non_empty[0]
+    return out if len(out) == len(wanted) else []
+
+
 def _repair_zone_bin_code_confusion(parsed, timeout_secs: float = 20):
     """
     Fixes zone_code/bin_code confusion on any line item carrying both
@@ -5100,6 +5961,20 @@ _BIG_GAP_RE = re.compile(_OCR_WS_PLACEHOLDER + "{2,}")
 
 
 def _split_line_into_gap_segments(line: str) -> list:
+    # A markdown table row ("| SUB TOTAL | S$4,335.36 |") separates its
+    # columns with "|" the way OCR text separates them with big gaps, so
+    # the cells ARE the segments. Without this, the "|" characters stayed
+    # inside the candidate text, the model returned values like
+    # "S$4,335.36 |", and the "already captured?" check then failed because
+    # "S$4,335.36 |" is not "S$4,335.36" -- producing duplicate fields.
+    stripped = line.strip()
+    if stripped.startswith("|") and not _is_md_separator_line(stripped):
+        out = []
+        for cell in stripped.strip("|").split("|"):
+            cell = re.sub(r"\s+", " ", cell.replace(_OCR_WS_PLACEHOLDER, " ")).strip()
+            if cell:
+                out.append(cell)
+        return out
     segments = _BIG_GAP_RE.split(line)
     out = []
     for seg in segments:
@@ -5187,16 +6062,23 @@ def _find_label_value_candidates(source_text: str, already_captured) -> list:
     seen = set()
     for line in source_text.splitlines():
         segments = _split_line_into_gap_segments(line)
+        is_md_row = line.strip().startswith("|")
         for seg in segments:
             if 3 <= len(seg) <= 160 and seg not in seen and not already_captured(seg):
                 seen.add(seg)
                 candidates.append(seg)
-        for i in range(len(segments) - 1):
+        # In a markdown row the cells are real table columns. Only a 2-cell
+        # row can be "label | value"; in a wider row (e.g. "DG000008 |
+        # PO-TB10084367 | Net EOM | SD007") neighbouring cells are separate
+        # values, and joining them made the model invent splits. Those
+        # tables are read by the table checks and the completeness pass.
+        pair_ok = (not is_md_row) or len(segments) == 2
+        for i in range(len(segments) - 1 if pair_ok else 0):
             combo = f"{segments[i]} {segments[i + 1]}"
             if 3 <= len(combo) <= 160 and combo not in seen and not already_captured(combo):
                 seen.add(combo)
                 candidates.append(combo)
-        for i in range(len(segments) - 2):
+        for i in range(0 if is_md_row else len(segments) - 2):
             combo = f"{segments[i]} {segments[i + 2]}"
             if 3 <= len(combo) <= 160 and combo not in seen and not already_captured(combo):
                 seen.add(combo)
@@ -5224,6 +6106,36 @@ _LABEL_VALUE_CHUNK_SIZE = 50
 # truncation loss this cap exists to prevent would recur simply because
 # there are now more candidates to get truncated.
 _MAX_LABEL_VALUE_CHUNKS = 8
+
+
+def _split_respects_token_boundaries(candidate: str, label: str, value: str) -> bool:
+    """
+    False when the model cut a label/value split INSIDE a word of the
+    candidate text, e.g. label "DG" + value "000008 PO-TB10084367" for the
+    text "DG000008 PO-TB10084367" -- the real code is "DG000008", so neither
+    half is a field. A split is only accepted when the value starts on a
+    word boundary and the label ends on one. If the label or value cannot
+    be located in the candidate (the model reworded it), this does not
+    judge and returns True; the existing grounding check still applies.
+    """
+    def _norm(x):
+        return re.sub(r"\s+", " ", x.lower()).strip()
+    c, lab, val = _norm(candidate), _norm(label), _norm(value)
+    if not val:
+        return True
+    vi = c.find(val)
+    if vi != -1:
+        if vi > 0 and c[vi - 1].isalnum() and val[0].isalnum():
+            return False
+        end = vi + len(val)
+        if end < len(c) and c[end].isalnum() and val[-1].isalnum():
+            return False
+    li = c.find(lab) if lab else -1
+    if li != -1:
+        le = li + len(lab)
+        if le < len(c) and c[le].isalnum() and lab[-1].isalnum():
+            return False
+    return True
 
 
 def _classify_label_value_chunk(candidates: list, timeout_secs: float) -> dict:
@@ -5401,7 +6313,9 @@ def _ensure_source_labels_captured(parsed: dict, source_text: str, timeout_secs:
                 continue
             if not (isinstance(value, str) and value.strip()):
                 continue
-            label, value = label.strip(), value.strip()
+            label, value = label.strip().strip("|").strip(), value.strip().strip("|").strip()
+            if not label or not value:
+                continue
 
             # Grounding check: the model's extracted value must actually
             # appear in the source span it was given -- guards against a
@@ -5410,6 +6324,8 @@ def _ensure_source_labels_captured(parsed: dict, source_text: str, timeout_secs:
             candidate_collapsed = re.sub(r"\s+", "", candidate.lower())
             value_collapsed = re.sub(r"\s+", "", value.lower())
             if value_collapsed not in candidate_collapsed:
+                continue
+            if not _split_respects_token_boundaries(candidate, label, value):
                 continue
 
             if _already_captured(value):
@@ -5592,7 +6508,10 @@ class SummarizeAgent(Agent):
         about correctness, only how much of the latency cost is actually
         felt.
         """
-        header_checklist_block = self._build_header_checklist_block(payload, text)
+        header_checklist_block = (
+            _checklist_from_md_header(header_context, row_texts)
+            or self._build_header_checklist_block(payload, text)
+        )
 
         # Fix codes (e.g. item_no) that OCR split across two physical
         # lines before any row goes to the model -- see
@@ -5602,6 +6521,7 @@ class SummarizeAgent(Agent):
         row_texts = [_reconstruct_split_row_values(rt) for rt in row_texts]
 
         per_row_timeout = max(payload.timeout_secs * 0.6 / max(len(row_texts), 1), 8)
+        row_headings = _group_headings_for_rows(text[row_start:row_end], row_texts)
         line_items = []
         any_row_repaired = False
 
@@ -5676,6 +6596,14 @@ class SummarizeAgent(Agent):
             "description line instead), it is still description text, "
             "not the quantity -- only apply this rule to the value that "
             "is actually this row's own quantity.\n"
+            "- VALUE TYPES: quantity, price, amount, rate, tax and total "
+            "columns are JSON numbers (digits only, no currency symbol or "
+            "code inside the number) -- when a currency symbol or code is "
+            "printed with the value (\"S$970.00\", \"21.00 SGD\"), put it in "
+            "its own field named <column>_currency. Identifier columns (item "
+            "no, SKU, EAN/UPC, part no, reference or code columns) are ALWAYS "
+            "strings exactly as printed, including leading zeros -- never a "
+            "number. Use the same type for a column on every row.\n"
             "- OCR TYPO CORRECTION (narrow): fix only an obvious one-"
             "character OCR misread of a common/standard word you already "
             "know with certainty (e.g. \"Sihgapore\" -> \"Singapore\"). Do "
@@ -5684,7 +6612,7 @@ class SummarizeAgent(Agent):
             "they look unusual.\n\n"
         )
 
-        def _extract_one_row(row_text: str) -> dict:
+        def _extract_one_row(row_text: str, group_heading=None) -> dict:
             """
             Runs entirely independently for one row -- no shared mutable
             state touched here, so this is safe to call concurrently
@@ -5714,6 +6642,13 @@ class SummarizeAgent(Agent):
                 + header_context + "\n\n"
                 + header_checklist_block
                 + row_prompt_rules
+                + (
+                    "GROUP HEADING PRINTED ABOVE THIS ROW (it names what this "
+                    "row is part of): " + group_heading + "\nKeep it in its "
+                    "own field named \"group_heading\", exactly as printed -- "
+                    "do not merge it into another field.\n\n"
+                    if group_heading else ""
+                )
                 + "ROW TEXT TO EXTRACT:\n" + row_text
             )
             row_dict = None
@@ -5759,6 +6694,14 @@ class SummarizeAgent(Agent):
             else:
                 row_dict = _repair_hallucinated_short_code_field(row_dict, row_text)
 
+            # Safety net: put back any cell printed in this row that the
+            # model left out or returned as null (see
+            # _backfill_uncaptured_row_cells). Also runs for a failed
+            # row, so its source cells are still kept.
+            row_dict = _backfill_uncaptured_row_cells(row_dict, row_text, header_context)
+            if group_heading and isinstance(row_dict, dict) and row_dict.get("group_heading") is None:
+                row_dict["group_heading"] = group_heading
+
             return {"row_dict": row_dict, "repaired": repaired}
 
         # Document-level metadata: everything OUTSIDE the table's own
@@ -5770,17 +6713,28 @@ class SummarizeAgent(Agent):
         # `doc_level_text`, never on any row's result.
         doc_level_text = text[:row_start] + text[row_end:]
         doc_prompt = (
-            "Read the document metadata below (this is everything in the "
+            "Read the document text below (this is everything in the "
             "source EXCEPT the line-item table rows themselves, which "
             "have already been extracted separately) and respond with a "
-            "single valid JSON object capturing document-level details "
-            "only: things like document type/title, reference numbers, "
-            "dates, assigned user/location codes, vendor/customer names, "
-            "and any handwritten annotation notes. Do NOT include a "
-            "`line_items` field -- that is added separately afterward. "
-            "Use null for any field genuinely blank or not stated. "
-            "Output ONLY the JSON object, no preamble, no markdown "
-            "fences:\n\n" + doc_level_text
+            "single valid JSON object that captures EVERY piece of "
+            "information printed in it -- nothing may be left out. That "
+            "includes: document type/title, reference numbers, dates, "
+            "assigned user/location codes, every party's name, address, "
+            "phone, fax, email and website, registration/tax/"
+            "certification numbers, terms, totals and tax lines, payment "
+            "or bank instructions, notes, signature/stamp/received-by "
+            "caption lines, and any handwritten annotation notes. Anything "
+            "that does not fit a standard field gets its own descriptive "
+            "lower_snake_case key, with the value copied exactly as "
+            "printed. A line that holds several facts (e.g. TEL and FAX) "
+            "becomes several fields. When one label has several values on "
+            "the same row (for example two amount columns next to "
+            "\"Subtotal\"), keep the first value under the label and name "
+            "the others <label>_2, <label>_3 in the order printed -- never "
+            "an invented suffix such as \"_total\". Do NOT include a `line_items` field "
+            "-- that is added separately afterward. Use null only for a "
+            "field that is printed but blank. Output ONLY the JSON "
+            "object, no preamble, no markdown fences:\n\n" + doc_level_text
         )
 
         def _extract_doc_metadata() -> "dict | None":
@@ -5803,7 +6757,10 @@ class SummarizeAgent(Agent):
 
         with ThreadPoolExecutor(max_workers=max(pool_size, 1)) as executor:
             row_futures = {
-                executor.submit(_extract_one_row, row_text): idx
+                executor.submit(
+                    _extract_one_row, row_text,
+                    row_headings[idx] if row_headings else None,
+                ): idx
                 for idx, row_text in enumerate(row_texts)
             }
             doc_future = executor.submit(_extract_doc_metadata)
@@ -5830,10 +6787,23 @@ class SummarizeAgent(Agent):
         doc_parsed = _repair_row_number_mistaken_for_item_code(doc_parsed, text, payload.timeout_secs)
         doc_parsed = _repair_reversed_party_roles(doc_parsed, text, payload.timeout_secs)
         doc_parsed = _repair_line_item_field_name_variants(doc_parsed, payload.timeout_secs)
+        doc_parsed = _normalize_line_item_column_types(doc_parsed)
         doc_parsed = _repair_quantity_amount_reconciliation(doc_parsed)
         doc_parsed = _verify_constant_fields_against_source(doc_parsed, text)
         doc_parsed = _flag_sibling_inconsistent_nulls(doc_parsed)
         doc_parsed = _ensure_handwriting_captured(doc_parsed, text)
+        # Model-driven completeness pass: show the model any source line
+        # that is still missing from the result and let it add the fields
+        # (see _model_complete_missing_source_text).
+        doc_parsed = _model_complete_missing_source_text(doc_parsed, text, payload.timeout_secs)
+        # Keep table lines that are not item rows (e.g. a group heading
+        # line) -- they are outside every per-row call and outside the
+        # document-level call, so nothing else would capture them.
+        doc_parsed = _capture_uncaptured_table_lines(doc_parsed, text[row_start:row_end], row_texts)
+        # Put back document-level markdown table values (totals box, A/C
+        # code strip) that the model steps left out -- plain text check,
+        # no model call, so it gives the same result on every run.
+        doc_parsed = _backfill_markdown_fields_outside_items(doc_parsed, text, row_start, row_end)
         # Deliberately scans the FULL `text`, not `doc_level_text`, for
         # this specific call -- confirmed in production that
         # _find_table_row_blocks's row-region boundary can overshoot and
@@ -6408,10 +7378,12 @@ class SummarizeAgent(Agent):
             parsed = _repair_row_number_mistaken_for_item_code(parsed, text, payload.timeout_secs)
             parsed = _repair_reversed_party_roles(parsed, text, payload.timeout_secs)
             parsed = _repair_line_item_field_name_variants(parsed, payload.timeout_secs)
+            parsed = _normalize_line_item_column_types(parsed)
             parsed = _repair_quantity_amount_reconciliation(parsed)
             parsed = _verify_constant_fields_against_source(parsed, text)
             parsed = _flag_sibling_inconsistent_nulls(parsed)
             parsed = _ensure_handwriting_captured(parsed, text)
+            parsed = _model_complete_missing_source_text(parsed, text, payload.timeout_secs)
             parsed = _ensure_source_labels_captured(parsed, text, payload.timeout_secs)
             cleaned = json.dumps(parsed, indent=2, ensure_ascii=False)
 
@@ -6499,10 +7471,12 @@ class SummarizeAgent(Agent):
                     retry_parsed = _repair_row_number_mistaken_for_item_code(retry_parsed, text, payload.timeout_secs)
                     retry_parsed = _repair_reversed_party_roles(retry_parsed, text, payload.timeout_secs)
                     retry_parsed = _repair_line_item_field_name_variants(retry_parsed, payload.timeout_secs)
+                    retry_parsed = _normalize_line_item_column_types(retry_parsed)
                     retry_parsed = _repair_quantity_amount_reconciliation(retry_parsed)
                     retry_parsed = _verify_constant_fields_against_source(retry_parsed, text)
                     retry_parsed = _flag_sibling_inconsistent_nulls(retry_parsed)
                     retry_parsed = _ensure_handwriting_captured(retry_parsed, text)
+                    retry_parsed = _model_complete_missing_source_text(retry_parsed, text, payload.timeout_secs)
                     retry_parsed = _ensure_source_labels_captured(retry_parsed, text, payload.timeout_secs)
                     retry_cleaned = json.dumps(retry_parsed, indent=2, ensure_ascii=False)
                     parsed, cleaned = retry_parsed, retry_cleaned

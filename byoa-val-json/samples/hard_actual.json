@@ -1,0 +1,11 @@
+{
+  "state": "Shipped",
+  "urgency": "HIGH",
+  "ccy": "Singapore Dollar",
+  "is_paid": "yes",
+  "buyer": {"full_name": "Tan Wei Ming", "membership": "Gold", "nation": "SG"},
+  "lines": [
+    {"title": "Mouse", "units": 3, "cost": 15, "rebate": 5},
+    {"title": "Keyboard", "units": 4, "cost": 40, "rebate": 5}
+  ]
+}

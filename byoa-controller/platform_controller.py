@@ -310,6 +310,13 @@ VLLM_MODEL = os.environ.get("VLLM_MODEL", "qwen3.6-35b-fp8")
 # equivalent bounded pattern there). Not set in .env -- this default of
 # 120s applies unless a GOAL_EXPANDER_TIMEOUT_SECS entry is added later.
 GOAL_EXPANDER_TIMEOUT_SECS = int(os.environ.get("GOAL_EXPANDER_TIMEOUT_SECS", "120"))
+# Caps how many agents one request's `agent_list` may name (see
+# plan_agent_route). Bounds the size of the route-planning prompt and stops
+# an accidental/abusive 500-agent list from reaching the model.
+MAX_AGENT_ROUTE_LENGTH = int(os.environ.get("MAX_AGENT_ROUTE_LENGTH", "12"))
+# How many times the route planner may ask the model for a valid route
+# (the first answer plus retries that are told exactly what was wrong).
+AGENT_ROUTE_MAX_ATTEMPTS = int(os.environ.get("AGENT_ROUTE_MAX_ATTEMPTS", "2"))
 MAX_PARALLEL_AGENTS = int(os.environ.get("MAX_PARALLEL_AGENTS", "5"))
 AGENT_CALL_TIMEOUT = int(os.environ.get("AGENT_CALL_TIMEOUT", "6000"))
 PLAN_TTL_SECS = int(os.environ.get("PLAN_TTL_SECS", "600"))
@@ -2559,7 +2566,8 @@ def _ensure_upload_content_used(tasks: list, doc_refs: list, agents: list, goal:
     return tasks
 
 
-def _save_goal_plan(job_id: str, goal: str, tasks: list, conversation_id: str = None) -> None:
+def _save_goal_plan(job_id: str, goal: str, tasks: list, conversation_id: str = None,
+                    agent_route: list = None) -> None:
     """
     Writes this goal's input text and its expanded task plan to
     GOALS_LOG_DIR as one JSON file per goal -- a plain, human-readable
@@ -2581,6 +2589,10 @@ def _save_goal_plan(job_id: str, goal: str, tasks: list, conversation_id: str = 
             "goal": goal,
             "expanded_tasks": tasks,
         }
+        if agent_route:
+            # Planned from the caller's agent_list, not by the Goal Expander.
+            record["planned_by"] = "agent_list"
+            record["agent_route"] = agent_route
         filename = f"{int(record['timestamp'])}_{job_id}.json"
         path = os.path.join(GOALS_LOG_DIR, filename)
         with open(path, "w") as f:
@@ -2678,6 +2690,654 @@ def expand_goal(goal: str, agents: list, doc_refs: list = None, session_id: str 
     tasks = _inject_combine_task(tasks, agent_index)
 
     return tasks
+
+
+# ── Caller-chosen agent route (agent_list) ───────────────────────────────────
+# POST /goal normally lets the Goal Expander (expand_goal) decide WHICH agents
+# to use and in what order. When the request carries an `agent_list` field --
+# comma-separated agent_ids, e.g. "byoa-websearch-agent,byoa-webcrawl-agent,
+# byoa-summarize-agent" -- the CALLER has already made that decision, so
+# plan_agent_route() below is used INSTEAD of expand_goal():
+#
+#   * The agents and their order are fixed by the list. Code (not the model)
+#     builds the plan's skeleton: exactly one task per listed position, in
+#     listed order, each task's agent_id forced to the listed id. The model
+#     can't add, drop, swap or reorder an agent.
+#   * The model is still asked to UNDERSTAND THE GOAL: it writes every task's
+#     description and inputs. The route is a TREE read in listed order -- a
+#     task may only use the output of agents listed BEFORE it, and every task
+#     after the first hangs off at least one earlier task, so nothing runs
+#     ahead of its place in the route.
+#   * Two ways to give the route (see _parse_agent_route):
+#       - a FLAT comma list, "a,b,c": the order is fixed; the model decides
+#         whether any later agent branches off an earlier one.
+#       - an EXPLICIT TREE using ">" and "[ ]", e.g. "a>b>[c,d]" (c and d
+#         both run after b, in parallel): the shape is fixed by the caller
+#         and the model cannot change it.
+#   * Everything after planning is the normal path: the result is the same
+#     task list shape, so uploads, the approval gate (/goal/<id>/approve),
+#     auto-approve rules, execution, status polling and the combine step
+#     behave exactly as they do for a planned goal.
+
+# Allowed shape of one agent id inside agent_list (matches how agent ids look
+# in the registry; anything else is rejected up front rather than reaching
+# the prompt).
+_AGENT_ID_TOKEN_RE = _re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}")
+
+
+# Tokens of the route syntax: "[" "]" ">" "," or an agent id.
+_ROUTE_TOKEN_RE = _re.compile(r"\[|\]|>|,|[^\s\[\]>,]+")
+
+
+# Quote characters people wrap ids in when pasting a list into a form field
+# or JSON ("a","b" / 'a','b' / typographic quotes / backticks).
+_ID_QUOTE_CHARS = "\"'`\u201c\u201d\u2018\u2019"
+
+
+def _clean_agent_id(token: str) -> str:
+    return token.strip().strip(_ID_QUOTE_CHARS).strip()
+
+
+def _unwrap_json_list_text(text: str) -> str:
+    """
+    A form field is always text, so a client that pastes a JSON array --
+    ["a","b","c"] or ["a",["b","c"]] -- sends it as a STRING. If the text is
+    a valid JSON array, it is read as the array it is (a flat list, or a
+    tree when it has a nested array; see _agent_list_text). Anything else,
+    including the tree syntax a>[b,c] (not valid JSON), is returned as is.
+    """
+    t = text.strip()
+    if t.startswith("[") and t.endswith("]"):
+        try:
+            value = json.loads(t)
+        except (json.JSONDecodeError, ValueError):
+            return text
+        if isinstance(value, list):
+            return _agent_list_text(value)
+    return text
+
+
+def _agent_list_text(value) -> str:
+    """
+    Turns a JSON-body `agent_list` value into the same text the form field
+    carries. A string is used as is. A plain list of strings is a flat
+    comma list. A list that contains a NESTED list is a tree: the top-level
+    items run one after another, and a nested list is a group of parallel
+    branches, e.g. ["search", "crawl", ["summarize", "fx"]] means
+    "search>crawl>[summarize,fx]".
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return _unwrap_json_list_text(value)
+    if isinstance(value, (list, tuple)):
+        has_nested = any(isinstance(v, (list, tuple)) for v in value)
+
+        def _to_text(v):
+            if isinstance(v, (list, tuple)):
+                return "[" + ",".join(_to_text(x) for x in v) + "]"
+            return str(v)
+
+        parts = [_to_text(v) for v in value]
+        return (">" if has_nested else ",").join(parts)
+    return str(value)
+
+
+def _parse_agent_route(raw) -> dict:
+    """
+    Parses the `agent_list` text into the route's structure. Two forms:
+
+    1. FLAT list -- plain commas, e.g. "agent-a,agent-b,agent-c". The agents
+       run in that order. Which earlier agent feeds which later one is left
+       to the model (it may branch when the goal calls for it), so
+       `explicit_tree` is False.
+
+    2. EXPLICIT TREE -- used as soon as the text contains ">" or "[ ]". The
+       shape is fixed by the caller and the model cannot change it:
+         a>b           b runs after a
+         a>[b,c]       b and c both run after a, in parallel (two branches)
+         a>[b>d,c]     a branch can itself be a chain: d runs after b
+         a>[b,c]>d     d runs after BOTH b and c (it joins the branches)
+         [a,b]>c       a and b start together; c runs after both
+       A comma outside brackets means "then", just like ">", so
+       "a,b,[c,d]" is "a>b>[c,d]". Inside brackets a comma starts a new
+       branch. Tasks are numbered in the order agents appear, left to right,
+       so a parent always has a smaller number than its children.
+
+    Returns {"nodes": [{"task_id", "agent_id", "parents": [task_ids]}...],
+    "explicit_tree": bool, "parents": {task_id: [parent task_ids]}}. Blank
+    text gives no nodes (meaning "no route given"). Raises ValueError, with
+    a message a client can act on, for a malformed tree (unbalanced
+    brackets, an empty "[]", a ">" with nothing after it...).
+    """
+    text = "" if raw is None else str(raw)
+
+    if not _re.search(r"[>\[\]]", text):
+        ids = [_clean_agent_id(t) for t in text.split(",")]
+        ids = [t for t in ids if t]
+        nodes = [{"task_id": i + 1, "agent_id": a, "parents": [i] if i else []}
+                 for i, a in enumerate(ids)]
+        return {"nodes": nodes, "explicit_tree": False,
+                "parents": {n["task_id"]: n["parents"] for n in nodes}}
+
+    tokens = _ROUTE_TOKEN_RE.findall(text)
+    nodes = []
+    cursor = [0]
+
+    def peek():
+        return tokens[cursor[0]] if cursor[0] < len(tokens) else None
+
+    def take():
+        tok = tokens[cursor[0]]
+        cursor[0] += 1
+        return tok
+
+    def parse_item(parents):
+        tok = peek()
+        if tok is None:
+            raise ValueError("the list ends where an agent id was expected "
+                             "(a '>' or ',' has nothing after it)")
+        if tok == "[":
+            take()
+            return parse_group(parents)
+        if tok in (">", ",", "]"):
+            if tok == "]" and cursor[0] > 0 and tokens[cursor[0] - 1] == "[":
+                raise ValueError("empty branch group '[]'")
+            raise ValueError(f"unexpected '{tok}' where an agent id was expected")
+        take()
+        agent_id = _clean_agent_id(tok)
+        if not agent_id:
+            raise ValueError(f"unexpected {tok!r} where an agent id was expected")
+        nodes.append({"task_id": len(nodes) + 1, "agent_id": agent_id, "parents": list(parents)})
+        return [len(nodes)]
+
+    def parse_seq(parents, commas_link):
+        exits = parse_item(parents)
+        while True:
+            tok = peek()
+            if tok == ">" or (tok == "," and commas_link):
+                take()
+                exits = parse_item(exits)
+            else:
+                return exits
+
+    def parse_group(parents):
+        exits = []
+        while True:
+            exits += parse_seq(parents, False)
+            tok = peek()
+            if tok == ",":
+                take()
+                continue
+            if tok == "]":
+                take()
+                return exits
+            raise ValueError("a '[' is never closed with ']'")
+
+    parse_seq([], True)
+    if peek() is not None:
+        raise ValueError(f"unexpected '{peek()}' (is there a ']' without a matching '[' ?)")
+    return {"nodes": nodes, "explicit_tree": True,
+            "parents": {n["task_id"]: n["parents"] for n in nodes}}
+
+
+def _parse_agent_list(raw) -> list:
+    """Just the agent ids of the route, in order (duplicates kept: an agent
+    listed twice is used twice). See _parse_agent_route for the syntax."""
+    return [n["agent_id"] for n in _parse_agent_route(raw)["nodes"]]
+
+
+AGENT_ROUTE_PROMPT_TEMPLATE = """You are a task planner for an AI agent platform.
+
+A user has submitted the following goal:
+\"\"\"{goal}\"\"\"
+{history_block}
+The caller has ALREADY CHOSEN which agents to use and in what order. You do NOT
+select agents and you do NOT decide the order -- both are fixed. The route, in
+execution order, is:
+{route_block}
+
+Your only job is to understand the goal and decide HOW each listed agent should
+be used to fulfil it.
+
+RULES:
+1. Produce exactly {count} tasks, one per route position, in the SAME order.
+   Task N uses the agent at position N, and its agent_id must be exactly that
+   listed id. Never add, drop, reorder, merge or replace an agent -- even if
+   you believe a different agent would suit the goal better. If the same
+   agent_id appears at several positions, each position is its own task.
+2. Write a task_description for each task (what that agent does for THIS goal)
+   and fill its inputs using only keys from that agent's input_schema, so the
+   agent does its part of the goal. Give each agent the kind of input its
+   description says it accepts -- for example a text-summarising agent takes
+   plain text content, never a bare URL; a page-fetching agent takes the URL.
+   Always give a summarising agent a "focus" that states what the user's goal
+   wants from the text (use the relevant part of the goal), and refer to "the
+   text" or "the sources" in it and in the task_description, never to "the
+   article": text fetched by a page-fetching agent can combine several pages.
+   Unless the goal asks for depth or detail, ask for a concise result (e.g.
+   "in 4-5 sentences").
+{structure_rules}5. To use an earlier task's output, reference it as $task_N.path, where N is
+   that task's task_id and path navigates the upstream agent's real
+   output_schema. Supported path syntax:
+     $task_1.field              -- plain field
+     $task_1.field[0]           -- first item of an array field
+     $task_1.field[0].subkey    -- a key inside an array item
+   RULES:
+   - field names MUST be exact keys from that agent's output_schema keys
+     listed above. NEVER invent a field name, and never copy a field name from
+     the example below -- it is illustrative syntax only.
+   - A reference can also be EMBEDDED inside a longer literal string (only the
+     token itself is replaced at run time), e.g. "query": "$task_1.summary
+     reviews", or two upstream values joined: "text": "$task_1.text\\n\\n$task_2.text".
+     The blank-line separator MUST be written as the escaped characters
+     backslash-n-backslash-n, never as a real line break inside the string --
+     your whole answer is parsed as JSON and a raw newline inside a string
+     breaks it.
+6. Do NOT add a task that "combines", "synthesizes" or "finalizes" other
+   tasks' outputs. The platform joins the outputs of every final task
+   automatically.
+{upload_note}
+Respond ONLY with a valid JSON array of exactly {count} items. No explanation,
+no markdown, no preamble. Each item must have exactly these fields:
+  - task_id: integer, 1 for the first route position, 2 for the second, ...
+  - task_description: string
+  - agent_id: string -- exactly the agent listed at that position
+  - inputs: object -- key-value pairs using that agent's input_schema keys
+  - depends_on: array of EARLIER task_ids this task waits for (empty only for a task at the start of the route)
+
+Example for a three-agent route "collect-agent,transform-agent,notify-agent"
+(every agent_id and field name here is PURELY FICTIONAL -- use only the real
+agent_ids and real output_schema keys listed above):
+[
+  {{
+    "task_id": 1,
+    "task_description": "Retrieve records relevant to the request",
+    "agent_id": "collect-agent",
+    "inputs": {{"dataset": "the dataset or subject the user asked about"}},
+    "depends_on": []
+  }},
+  {{
+    "task_id": 2,
+    "task_description": "Transform the first retrieved record into the required format",
+    "agent_id": "transform-agent",
+    "inputs": {{"item_id": "$task_1.records[0].id"}},
+    "depends_on": [1]
+  }},
+  {{
+    "task_id": 3,
+    "task_description": "Deliver the transformed result",
+    "agent_id": "notify-agent",
+    "inputs": {{"message": "$task_2.formatted_output"}},
+    "depends_on": [2]
+  }}
+]
+{feedback_block}"""
+
+
+_ROUTE_RULES_FLAT = """3. The route is a TREE read in the listed order. A task may use the output of
+   EARLIER positions only -- never a later one. Every task after the first
+   MUST list at least one EARLIER task_id in depends_on. By default a task
+   depends on the position right before it (a straight chain). Make it depend
+   on a different earlier position instead only when the goal clearly calls
+   for branches -- e.g. two later agents that both work on the same earlier
+   agent's output.
+4. depends_on must mirror the $task_N references in the task's own inputs:
+   every earlier task a task's inputs reference must be in its depends_on.
+"""
+
+_ROUTE_RULES_FIXED_TREE = """3. The route is a TREE and its SHAPE IS FIXED by the caller. Each position above
+   says what it "runs after". Set every task's depends_on to EXACTLY that list
+   (empty for a position that runs after nothing). Positions with the same
+   "runs after" are parallel branches; a position that runs after several
+   tasks starts only when all of them are done. Do not add, remove or change
+   any of these links.
+4. A task may use outputs only from the tasks it runs after and from THEIR
+   ancestors further up the tree -- never from a task on another branch and
+   never from a later task, because those may not have finished. Every
+   $task_N reference in a task's inputs must point to one of those.
+"""
+
+
+def _build_route_upload_note(doc_refs: list, session_id: str) -> str:
+    """
+    Tells the route planner about file(s) attached to THIS goal, using the
+    same reserved $task_9001+ references and knowledge-base scoping the Goal
+    Expander's upload rule uses (see _build_upload_rule), minus that rule's
+    planner-only wording. These references are NOT route tasks: they are
+    already available, so they never go in depends_on.
+    """
+    if not doc_refs:
+        return ""
+    inline_lines, json_lines, large_lines = [], [], []
+    n = 0
+    for d in doc_refs:
+        filename = d.get("filename") or d.get("original_filename") or "a document"
+        text = d.get("full_text", "")
+        if text and len(text) <= MAX_INLINE_UPLOAD_CHARS:
+            tid = UPLOAD_TASK_ID_BASE + n
+            n += 1
+            inline_lines.append(f'      - "{filename}" -- full text is available as $task_{tid}.text')
+            if d.get("is_json"):
+                json_lines.append(f'      - "{filename}" -- parsed JSON object is available as $task_{tid}.json')
+        else:
+            large_lines.append(f'      - "{filename}" (too large to inline) -- doc_id="{d.get("doc_id")}"')
+    if not inline_lines and not large_lines:
+        return ""
+
+    parts = ["7. FILES attached to this goal. These are NOT route tasks and must NEVER appear in depends_on --\n"
+             "   they are already available:\n"]
+    if inline_lines:
+        parts.append(
+            "   Inline files (content already available, no agent call needed to get it):\n"
+            + "\n".join(inline_lines) + "\n"
+            "   When a task's agent should work on a file's content, put the reference above\n"
+            "   straight into that task's input (use the EXACT reserved number listed for that\n"
+            "   file). Use the route's agents on the file; do not invent extra steps to fetch it.\n"
+        )
+    if json_lines:
+        parts.append(
+            "   JSON files also have their parsed object available (use it, instead of the\n"
+            "   text form, when an agent in the route takes JSON documents, e.g. a matching\n"
+            "   agent's \"documents\" list):\n" + "\n".join(json_lines) + "\n"
+        )
+    if large_lines:
+        parts.append(
+            "   Large files, stored in the knowledge base scoped to session_id=\"" + str(session_id) + "\":\n"
+            + "\n".join(large_lines) + "\n"
+            "   If a knowledge-retrieving agent is in the route, give it \"session_id\": \""
+            + str(session_id) + "\" (and the file's \"doc_id\" when more than one large file is\n"
+            "   attached). For a request about the WHOLE file (summarise/describe it), also set\n"
+            "   \"fetch_all\": true and use that task's full_text output downstream.\n"
+        )
+    return "\n" + "".join(parts)
+
+
+def _agent_route_block(route_agents: list, parents: dict = None) -> str:
+    """One numbered entry per route position: id, description and schemas.
+    With `parents` (an explicit tree) each entry also says which task(s) it
+    runs after."""
+    entries = []
+    for pos, a in enumerate(route_agents, start=1):
+        in_schema = {k: v for k, v in (a.get("input_schema") or {}).items() if k != "max_attempts"}
+        try:
+            in_text = json.dumps(in_schema, ensure_ascii=False, default=str)
+        except Exception:
+            in_text = str(list(in_schema.keys()))
+        if len(in_text) > 1500:
+            in_text = in_text[:1500] + "...(truncated)"
+        out_schema = a.get("output_schema", {}) or {}
+        out_keys = list(out_schema.get("properties", out_schema).keys())
+        runs_after = ""
+        if parents is not None:
+            ps = parents.get(pos, [])
+            runs_after = ("     runs after: " + (", ".join(f"task {p}" for p in ps) if ps
+                                                  else "nothing (starts first)") + "\n")
+        entries.append(
+            f'  {pos}. agent_id: {a["agent_id"]}\n'
+            + runs_after +
+            f'     display_name: {a.get("display_name", a["agent_id"])}\n'
+            f'     description: {a.get("description", "")}\n'
+            f'     capabilities: {a.get("capabilities", [])}\n'
+            f'     input_schema: {in_text}\n'
+            f'     output_schema keys: {out_keys}'
+        )
+    return "\n".join(entries)
+
+
+def build_agent_route_prompt(goal: str, route_agents: list, doc_refs: list = None, session_id: str = None,
+                             history: list = None, feedback: list = None, parents: dict = None) -> str:
+    history_block = _build_history_block(history) if history else ""
+    feedback_block = ""
+    if feedback:
+        feedback_block = (
+            "\nYour previous answer was REJECTED for these reasons. Fix every one of them "
+            "and answer again:\n" + "\n".join(f"  - {f}" for f in feedback) + "\n"
+        )
+    return AGENT_ROUTE_PROMPT_TEMPLATE.format(
+        goal=goal,
+        history_block=history_block,
+        route_block=_agent_route_block(route_agents, parents),
+        count=len(route_agents),
+        structure_rules=_ROUTE_RULES_FIXED_TREE if parents is not None else _ROUTE_RULES_FLAT,
+        upload_note=_build_route_upload_note(doc_refs, session_id),
+        feedback_block=feedback_block,
+    )
+
+
+def _normalize_agent_route_tasks(raw, route_ids: list, agent_index: dict, parents: dict = None):
+    """
+    Checks the model's answer against the fixed route and repairs only what
+    can be repaired mechanically. Returns (tasks, errors): `errors` is a list
+    of plain-language reasons (empty when the plan is good) that is fed back
+    to the model for a retry; `tasks` is None whenever there are errors.
+
+    HARD errors (sent back to the model): not a list; wrong number of tasks;
+    a task whose agent_id is not the one listed at its position; inputs that
+    are not an object; a reference to a task that is not EARLIER in the route
+    (itself or a later one); a $task_N.field that is not a real output field
+    of the upstream agent (validate_task_references).
+
+    Repaired deterministically (no retry needed), since the route itself
+    tells us the right answer: task_id is set to the position; depends_on is
+    cleaned to earlier positions only; every earlier task a task REFERENCES
+    in its inputs is added to its depends_on (execute_tasks only waits on
+    depends_on, so an unlisted reference would otherwise read a result that
+    does not exist yet); a task after the first that ended up with no
+    dependency at all depends on the position right before it, so nothing
+    runs ahead of its place in the route; the first task has none.
+
+    With `parents` (the caller wrote an EXPLICIT tree, see
+    _parse_agent_route) the shape is not the model's to decide: every task's
+    depends_on is set to exactly its parents (whatever the model wrote is
+    replaced), and the inputs may only reference the task's ANCESTORS -- a
+    reference to a task on another branch is a hard error, because that task
+    may not have finished when this one starts.
+    """
+    def _ancestors(pos, seen=None):
+        seen = set() if seen is None else seen
+        for q in (parents or {}).get(pos, []):
+            if q not in seen:
+                seen.add(q)
+                _ancestors(q, seen)
+        return seen
+
+    errors = []
+    n = len(route_ids)
+    if not isinstance(raw, list):
+        return None, ["The answer must be a JSON array of tasks"]
+    if len(raw) != n:
+        return None, [f"Expected exactly {n} tasks, one per route position in this order "
+                      f"{route_ids}, but got {len(raw)}"]
+
+    tasks = []
+    for pos, (item, agent_id) in enumerate(zip(raw, route_ids), start=1):
+        if not isinstance(item, dict):
+            errors.append(f"Task {pos} must be a JSON object")
+            continue
+        if item.get("agent_id") != agent_id:
+            errors.append(f"Task {pos} must use agent_id {agent_id!r} (the agent listed at "
+                          f"position {pos}), but it used {item.get('agent_id')!r}")
+        inputs = item.get("inputs", {})
+        if inputs is None:
+            inputs = {}
+        if not isinstance(inputs, dict):
+            errors.append(f"Task {pos}: inputs must be a JSON object")
+            inputs = {}
+        raw_deps = item.get("depends_on") or []
+        if not isinstance(raw_deps, list):
+            raw_deps = [raw_deps]
+        deps = []
+        for d in raw_deps:
+            try:
+                deps.append(int(d))
+            except (TypeError, ValueError):
+                pass
+        tasks.append({
+            "task_id": pos,
+            "task_description": str(item.get("task_description") or f"Run {agent_id}"),
+            "agent_id": agent_id,
+            "inputs": inputs,
+            "depends_on": deps,
+        })
+    if errors:
+        return None, errors
+
+    for t in tasks:
+        pos = t["task_id"]
+        referenced = set()
+        for val in t["inputs"].values():
+            for piece in (val if isinstance(val, list) else [val]):
+                if isinstance(piece, str) and "$task_" in piece:
+                    referenced.update(int(m.group(1)) for m in _TASK_REF_TOKEN_RE.finditer(piece))
+        plan_refs = {r for r in referenced if r < UPLOAD_TASK_ID_BASE}
+        not_earlier = sorted(r for r in plan_refs if r >= pos)
+        if not_earlier:
+            errors.append(f"Task {pos} references the output of task(s) {not_earlier}, which are not "
+                          f"EARLIER in the route; a task may only use outputs of agents listed before it")
+        elif parents is not None:
+            off_branch = sorted(r for r in plan_refs if r not in _ancestors(pos))
+            if off_branch:
+                errors.append(f"Task {pos} references task(s) {off_branch}, which are not among the tasks it "
+                              f"runs after or their ancestors; it runs after {sorted(parents.get(pos, []))}. "
+                              f"Only those tasks' outputs are available to it")
+    if errors:
+        return None, errors
+
+    errors = validate_task_references(tasks, agent_index)
+    if errors:
+        return None, errors
+
+    for t in tasks:
+        pos = t["task_id"]
+        referenced = set()
+        for val in t["inputs"].values():
+            for piece in (val if isinstance(val, list) else [val]):
+                if isinstance(piece, str) and "$task_" in piece:
+                    referenced.update(int(m.group(1)) for m in _TASK_REF_TOKEN_RE.finditer(piece))
+        if parents is not None:
+            t["depends_on"] = sorted(parents.get(pos, []))
+            continue
+        deps = {d for d in t["depends_on"] if 1 <= d < pos}
+        deps |= {r for r in referenced if 1 <= r < pos}
+        if pos == 1:
+            deps = set()
+        elif not deps:
+            deps = {pos - 1}
+        t["depends_on"] = sorted(deps)
+    return tasks, []
+
+
+def _llm_json_value(prompt: str):
+    """One model call that must answer with JSON; same call settings and the
+    same mechanical JSON repair as expand_goal(). Raises ValueError if the
+    answer is not parseable JSON."""
+    r = req.post(
+        f"{VLLM_BASE_URL}/v1/chat/completions",
+        json={
+            "model": VLLM_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 8192,
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        timeout=GOAL_EXPANDER_TIMEOUT_SECS,
+    )
+    r.raise_for_status()
+    raw = r.json()["choices"][0]["message"]["content"].strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        try:
+            return json.loads(_repair_json_control_chars(raw))
+        except json.JSONDecodeError:
+            raise ValueError(f"The route planner returned invalid JSON: {e}\nRaw:\n{raw}")
+
+
+def plan_agent_route(goal: str, agents: list, agent_ids: list, doc_refs: list = None,
+                     session_id: str = None, history: list = None, parents: dict = None) -> list:
+    """
+    Builds the task plan for a caller-chosen route (see the section comment
+    above). Returns the same task-list shape expand_goal() returns, so the
+    rest of /goal treats it identically.
+
+    `parents`, when given, is the caller's EXPLICIT tree ({task_id: [parent
+    task_ids]}, from _parse_agent_route): the shape is then fixed -- the
+    model fills in inputs but cannot change which task depends on which.
+    Without it (a flat list) the model may branch where the goal calls for it.
+
+    Raises ValueError (surfaced to the client as the job error) when an id in
+    `agent_ids` is not a currently active registered agent, or when the model
+    could not produce a valid plan for this exact route after
+    AGENT_ROUTE_MAX_ATTEMPTS tries. It never "falls back" to letting the
+    Goal Expander pick agents: the caller asked for this route, so failing
+    clearly is the honest result.
+
+    Deliberately NOT applied here: the Goal Expander's own post-processing
+    that changes WHICH tasks exist (_drop_web_search_for_financial_json_upload,
+    _ensure_upload_content_used, _drop_unreferenced_dependencies) -- each can
+    add, remove or unchain tasks, which would break "follow the listed route".
+    _inject_combine_task IS applied, because it only appends the final
+    join-the-outputs step when the tree ends in more than one leaf.
+    """
+    agent_index = {a["agent_id"]: a for a in agents}
+    unknown = [i for i in dict.fromkeys(agent_ids) if i not in agent_index]
+    if unknown:
+        raise ValueError(
+            f"Unknown or inactive agent_id(s) in agent_list: {unknown}. "
+            f"Active agent_ids: {sorted(agent_index)}"
+        )
+    route_agents = [agent_index[i] for i in agent_ids]
+
+    feedback = None
+    tasks, errors = None, ["no attempt was made"]
+    for attempt in range(1, max(AGENT_ROUTE_MAX_ATTEMPTS, 1) + 1):
+        prompt = build_agent_route_prompt(goal, route_agents, doc_refs=doc_refs, session_id=session_id,
+                                          history=history, feedback=feedback, parents=parents)
+        try:
+            raw = _llm_json_value(prompt)
+        except ValueError as e:
+            errors = [str(e).splitlines()[0]]
+            feedback = ["Your answer was not valid JSON. Answer with ONLY the JSON array."]
+            print(f"[ROUTE] attempt {attempt}: {errors[0]}", flush=True)
+            continue
+        tasks, errors = _normalize_agent_route_tasks(raw, agent_ids, agent_index, parents=parents)
+        if not errors:
+            break
+        feedback = errors
+        print(f"[ROUTE] attempt {attempt} rejected: {errors}", flush=True)
+    if errors:
+        raise ValueError(
+            f"Could not plan the route {agent_ids} for this goal after "
+            f"{max(AGENT_ROUTE_MAX_ATTEMPTS, 1)} attempt(s): " + "; ".join(errors)
+        )
+    return _inject_combine_task(tasks, agent_index)
+
+
+def _route_upload_warnings(tasks: list, doc_refs: list, session_id: str) -> list:
+    """Plain-language warnings for attached files no task in the route uses
+    (the route is the caller's choice, so this is reported, not 'fixed')."""
+    if not doc_refs:
+        return []
+    blob = json.dumps([t.get("inputs", {}) for t in tasks], default=str)
+    warnings = []
+    n = 0
+    for d in doc_refs:
+        name = d.get("filename") or d.get("original_filename") or "a document"
+        text = d.get("full_text", "")
+        if text and len(text) <= MAX_INLINE_UPLOAD_CHARS:
+            tid = UPLOAD_TASK_ID_BASE + n
+            n += 1
+            used = f"$task_{tid}" in blob
+        else:
+            used = str(d.get("doc_id")) in blob or bool(session_id and str(session_id) in blob)
+        if not used:
+            warnings.append(f'The uploaded file "{name}" is not used by any task in this route')
+    return warnings
 
 
 # The combine step is a CONTROLLER-NATIVE step, not a real registered agent --
@@ -2900,6 +3560,17 @@ def _run_combine_task(resolved_inputs: dict) -> dict:
                     # entirely; its content now lives only in `media`.
                     text = ""
                     needs_label = False
+            elif (isinstance(item.get("summary"), str) and item["summary"].strip()
+                  and item.get("structured") is None and item.get("output_format") != "json"):
+                # A PROSE result from a summarising agent: the readable answer
+                # is `summary`; every other key in that object (input_length,
+                # model, extraction_condensed, gap_fill_triggered ...) is the
+                # agent's own diagnostics. The combine step receives the WHOLE
+                # outputs object (see _inject_combine_task for why), so without
+                # this the final answer printed all of them as "key: value".
+                # Treated like a plain prose entry: just the paragraph, no label.
+                text = item["summary"].strip()
+                needs_label = False
             else:
                 text = ", ".join(f"{k}: {v}" for k, v in item.items())
                 needs_label = True
@@ -5791,6 +6462,9 @@ def goal_endpoint():
         else:
             file_upload_ids = request.form.getlist("file_upload_ids")
         conversation_id = (request.form.get("conversation_id") or "").strip() or None
+        # Comma-separated agent ids ("agent-a,agent-b") or a tree
+        # ("agent-a>[agent-b,agent-c]"). See _parse_agent_route.
+        agent_list_raw = _agent_list_text(",".join(request.form.getlist("agent_list")))
     else:
         body = request.get_json(silent=True) or {}
         goal = body.get("goal", "").strip()
@@ -5798,9 +6472,28 @@ def goal_endpoint():
         uploaded_files = []
         file_upload_ids = body.get("file_upload_ids", []) or []
         conversation_id = (body.get("conversation_id") or "").strip() or None
+        agent_list_raw = _agent_list_text(body.get("agent_list"))
 
     if not goal:
         return jsonify({"error": "Missing required field: goal"}), 400
+
+    # agent_list given -> the caller chose the route; the Goal Expander is
+    # skipped (see plan_agent_route). An empty/blank agent_list (a form that
+    # always sends the field) simply means "not given" and the goal is
+    # planned normally. Checked here, before any upload work, so a bad list
+    # is rejected immediately.
+    try:
+        agent_route_spec = _parse_agent_route(agent_list_raw)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid agent_list: {e}"}), 400
+    agent_list_ids = [n["agent_id"] for n in agent_route_spec["nodes"]]
+    if agent_list_ids:
+        bad_ids = [i for i in agent_list_ids if not _AGENT_ID_TOKEN_RE.fullmatch(i)]
+        if bad_ids:
+            return jsonify({"error": f"Invalid agent id(s) in agent_list: {bad_ids}"}), 400
+        if len(agent_list_ids) > MAX_AGENT_ROUTE_LENGTH:
+            return jsonify({"error": f"agent_list names {len(agent_list_ids)} agents "
+                                     f"(max {MAX_AGENT_ROUTE_LENGTH})"}), 400
 
     # First message of a new chat thread -- the frontend has no
     # conversation_id yet. Mint one here and hand it back in every response
@@ -5976,16 +6669,43 @@ def goal_endpoint():
         history = get_conversation_history(conversation_id)
 
         try:
-            tasks = expand_goal(goal, agents, doc_refs=doc_refs,
-                                session_id=conversation_id if doc_refs else None,
-                                history=history, force_use_doc_ids=fresh_doc_ids)
+            if agent_list_ids:
+                # Caller-chosen route: agents and order are fixed by the
+                # list; the model only works out inputs/dependencies from
+                # the goal. No Goal Expander agent selection.
+                tasks = plan_agent_route(goal, agents, agent_list_ids, doc_refs=doc_refs,
+                                         session_id=conversation_id if doc_refs else None,
+                                         history=history,
+                                         parents=(agent_route_spec["parents"]
+                                                  if agent_route_spec["explicit_tree"] else None))
+            else:
+                tasks = expand_goal(goal, agents, doc_refs=doc_refs,
+                                    session_id=conversation_id if doc_refs else None,
+                                    history=history, force_use_doc_ids=fresh_doc_ids)
         except Exception as e:
             with _goal_jobs_lock:
                 _goal_jobs[job_id] = {"status": "error", "result": None,
-                                       "error": f"Goal expansion failed: {str(e)}",
+                                       "error": (f"Agent route planning failed: {str(e)}" if agent_list_ids
+                                                 else f"Goal expansion failed: {str(e)}"),
                                        "completed_at": time.time(),
                                        "conversation_id": conversation_id}
             return
+
+        # Extra fields added to the job result for a caller-chosen route, so
+        # the client can see which path produced the plan (empty otherwise,
+        # leaving every normal response byte-for-byte unchanged).
+        route_meta = {}
+        if agent_list_ids:
+            route_meta = {"planned_by": "agent_list", "agent_route": agent_list_ids}
+            if agent_route_spec["explicit_tree"]:
+                # The tree exactly as given: which task runs after which.
+                route_meta["agent_tree"] = [
+                    {"task_id": n["task_id"], "agent_id": n["agent_id"], "runs_after": n["parents"]}
+                    for n in agent_route_spec["nodes"]
+                ]
+            route_warnings = _route_upload_warnings(tasks, doc_refs, conversation_id if doc_refs else None)
+            if route_warnings:
+                route_meta["route_warnings"] = route_warnings
 
         # Deferred file cap (see goal_endpoint): only a plan that contains a
         # data-matching task AND is auto-approved (the same
@@ -6007,7 +6727,7 @@ def goal_endpoint():
                                        "conversation_id": conversation_id}
             return
 
-        _save_goal_plan(job_id, goal, tasks, conversation_id)
+        _save_goal_plan(job_id, goal, tasks, conversation_id, agent_route=agent_list_ids or None)
 
         if not tasks:
             with _goal_jobs_lock:
@@ -6109,6 +6829,7 @@ def goal_endpoint():
                         "task_outputs": task_outputs,
                         "uploaded_docs": doc_refs,
                         "conversation_id": conversation_id,
+                        **route_meta,
                     },
                 }
             return
@@ -6131,6 +6852,7 @@ def goal_endpoint():
                     "reject_url": f"/goal/{plan_id}/reject",
                     "uploaded_docs": doc_refs,
                     "conversation_id": conversation_id,
+                    **route_meta,
                 },
             }
 
