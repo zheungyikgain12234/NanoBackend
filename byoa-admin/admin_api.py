@@ -10,6 +10,9 @@ BYOA Admin API -- backs the Flutter admin app.
   GET  /agents                     -> registered agents (from the registration server)
   GET  /code/reference             -> ADK facts for the editor (capabilities, version)
   POST /code/check                 -> static check of agent source (parse only, never run)
+  POST /code/generate              -> start a job: the model fills the TODO sections of
+                                      agent.py from a text prompt -> {job_id} (202)
+  GET  /code/generate/<job_id>     -> poll that job: queued | running | done | error
   POST /verify-secret              -> check the RUNNING agent accepts its stored secret
   POST /register                   -> register an agent; this API signs the
                                       identity token with the agent's stored
@@ -21,7 +24,9 @@ before exposing it; do not bind it to a public interface directly.
 
 Env: PLATFORM_DB_URL, ADMIN_JWT_SECRET (required); PORT (4150),
      ADMIN_HOST (127.0.0.1), REGISTRATION_URL (http://localhost:4100),
-     ADMIN_CORS_ORIGINS (comma list, no wildcard), ADMIN_AUDIT_LOG.
+     ADMIN_CORS_ORIGINS (comma list, no wildcard), ADMIN_AUDIT_LOG,
+     VLLM_BASE_URL (http://localhost:11500), VLLM_MODEL (qwen3.6-35b-fp8),
+     GEN_CONCURRENCY (2), GEN_MAX_ATTEMPTS (3).
 """
 import json
 import os
@@ -47,6 +52,7 @@ from agent_credentials import (  # noqa: E402
 from admin_users import init_admin_table, verify_login  # noqa: E402
 from registry import delete_agent, unregister_agent  # noqa: E402
 from agent_check import check_agent_code, reference  # noqa: E402
+import code_generate  # noqa: E402
 from byoa_adk.manifest import parse_agent_md  # noqa: E402
 from byoa_adk.schema import ALLOWED_CAPABILITIES  # noqa: E402
 from byoa_adk.security import issue_agent_token, sign_request  # noqa: E402
@@ -236,6 +242,31 @@ def code_check():
     if not isinstance(code, str):
         return jsonify({"error": "code (a string) is required."}), 400
     return jsonify(check_agent_code(code))
+
+
+@app.post("/code/generate")
+@require_admin
+def code_generate_start():
+    """Start filling agent.py's TODO sections from a prompt. Returns at once; poll the job."""
+    body = request.get_json(silent=True) or {}
+    prompt, code = body.get("prompt"), body.get("code")
+    if not isinstance(prompt, str) or not isinstance(code, str):
+        return jsonify({"error": "prompt and code (strings) are required."}), 400
+    try:
+        job_id = code_generate.start_job(g.admin, prompt, code)
+    except code_generate.GenerateError as exc:
+        return jsonify({"error": str(exc)}), 422
+    audit("code_generate_start", admin=g.admin, job_id=job_id, prompt_chars=len(prompt))
+    return jsonify({"job_id": job_id}), 202
+
+
+@app.get("/code/generate/<job_id>")
+@require_admin
+def code_generate_status(job_id):
+    job = code_generate.get_job(g.admin, job_id)
+    if job is None:
+        return jsonify({"error": "Unknown or expired job."}), 404
+    return jsonify(job)
 
 
 @app.post("/verify-secret")
